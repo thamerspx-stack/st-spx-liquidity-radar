@@ -32,6 +32,8 @@ const SEND_EVERY_MS = 15 * 60 * 1000;
 
 let lastSentSignature = '';
 let lastSentAt = 0;
+let botStarted = false;
+let intervalStarted = false;
 
 function isAdmin(msg) {
   return ADMIN_IDS.includes(String(msg.from?.id || ''));
@@ -483,15 +485,6 @@ function flowSummary(callVolume, putVolume) {
   return { callPct, putPct };
 }
 
-function marketBiasByGamma(netGamma, flow) {
-  if (netGamma > 0 && flow.putPct >= 58) return 'إيجابية بحذر';
-  if (netGamma > 0 && flow.callPct >= 58) return 'إيجابية';
-  if (netGamma > 0) return 'Positive Gamma';
-  if (netGamma < 0 && flow.putPct >= 58) return 'سلبية متذبذبة';
-  if (netGamma < 0) return 'Negative Gamma';
-  return 'محايدة';
-}
-
 function levelLine(item) {
   if (!item) return 'N/A';
   return fmtLevel(item.strike);
@@ -599,14 +592,12 @@ async function buildReport() {
 
   const livePrice = await getLiveSPXPrice();
   const fallbackPrice = getFallbackUnderlyingPrice(chain);
-
   const price = livePrice || fallbackPrice;
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
   const levels = getLevels(gamma, price);
   const flip = gammaFlipNearPrice(gamma.netByStrike, price);
-  const state = marketBiasByGamma(gamma.netGamma, flow);
 
   const data = {
     price,
@@ -685,14 +676,16 @@ async function scanAndSend(force = false, targetChatId = null) {
     const changed = signature !== lastSentSignature;
     const timePassed = now - lastSentAt >= SEND_EVERY_MS;
 
-    if (force || changed || timePassed) {
-      await sendReportToActiveSubscribers(text);
-      lastSentSignature = signature;
-      lastSentAt = now;
-      console.log('SPX report sent.');
-    } else {
+    if (!force && !changed && !timePassed) {
       console.log('No important change. Skipping message.');
+      return;
     }
+
+    await sendReportToActiveSubscribers(text);
+    lastSentSignature = signature;
+    lastSentAt = now;
+    console.log('SPX report sent.');
+
   } catch (err) {
     console.error('SPX BOT ERROR:', err.response?.data || err.message);
   }
@@ -844,7 +837,40 @@ bot.onText(/\/test/, async (msg) => {
   await scanAndSend(true, msg.chat.id);
 });
 
-scanAndSend(true);
-setInterval(scanAndSend, INTERVAL_MS);
+// =====================
+// Start Bot
+// =====================
 
 console.log('ST Gamma Radar is running...');
+
+async function startBot() {
+  if (botStarted) {
+    console.log('Bot already started.');
+    return;
+  }
+
+  botStarted = true;
+
+  try {
+    await scanAndSend(false);
+
+    if (!intervalStarted) {
+      intervalStarted = true;
+
+      setInterval(async () => {
+        try {
+          await scanAndSend(false);
+        } catch (err) {
+          console.log('Interval scan error:', err.response?.data || err.message);
+        }
+      }, INTERVAL_MS);
+    }
+
+    console.log('Gamma Radar loop started.');
+
+  } catch (err) {
+    console.log('Bot startup error:', err.response?.data || err.message);
+  }
+}
+
+startBot();
