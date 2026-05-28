@@ -1,18 +1,20 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const app = express();
+app.use(express.json());
+
+const bot = new TelegramBot(process.env.BOT_TOKEN, {
+  polling: false
+});
 
 console.log('Telegram bot connected');
 
-bot.on('message', (msg) => {
-  console.log('Message:', msg.text);
-});
-
 const API_KEY = process.env.MASSIVE_API_KEY;
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
-const CHAT_ID = process.env.SPX_CHAT_ID || '';
+const CHAT_ID = process.env.SPX_CHAT_ID || process.env.SIGNALS_CHAT_ID || '';
 
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .split(',')
@@ -27,11 +29,7 @@ const supabase = createClient(
 const BASE_URL = 'https://api.massive.com';
 
 const TEST_MODE = false;
-
-// يفحص كل دقيقة، لكن لا يرسل إلا عند تغيير مهم
 const INTERVAL_MS = 60 * 1000;
-
-// منع تكرار نفس التنبيه بسرعة
 const ALERT_COOLDOWN_MS = 5 * 60 * 1000;
 
 let lastState = null;
@@ -81,10 +79,7 @@ function shortKsaTime() {
 
 function nyDateString() {
   const d = nowNewYork();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function isMarketTime() {
@@ -92,16 +87,11 @@ function isMarketTime() {
 
   const d = nowNewYork();
   const day = d.getDay();
-  const h = d.getHours();
-  const m = d.getMinutes();
-  const minutes = h * 60 + m;
+  const minutes = d.getHours() * 60 + d.getMinutes();
 
   if (day === 0 || day === 6) return false;
 
-  const open = 9 * 60 + 30;
-  const close = 16 * 60;
-
-  return minutes >= open && minutes <= close;
+  return minutes >= 570 && minutes <= 960;
 }
 
 function randomCode(length = 10) {
@@ -495,10 +485,6 @@ function levelLine(item) {
   return fmtLevel(item.strike);
 }
 
-function buildCurrentState() {
-  return null;
-}
-
 function buildSignature(state) {
   return [
     state.price || 'NO_PRICE',
@@ -530,7 +516,6 @@ function detectAlert(prev, curr) {
   const prevMagnet = prev.levels.balance?.strike;
 
   const flip = curr.flip;
-  const prevFlip = prev.flip;
 
   const resistance1 = curr.levels.resistance1?.strike;
   const resistance2 = curr.levels.resistance2?.strike;
@@ -670,7 +655,7 @@ ${fmtLevel(resistance1)} → ${fmtLevel(resistance2)}`
 
   if (flowShiftToPut) {
     return {
-      type: '🔴 PUT_FLOW_SHIFT',
+      type: 'PUT_FLOW_SHIFT',
       shouldSend: true,
       title: '🔴 Flow Shift — SPX',
       text:
@@ -1027,6 +1012,64 @@ bot.onText(/\/test/, async (msg) => {
   await scanAndAlert(true, msg.chat.id);
 });
 
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('Webhook received:', req.body);
+
+    const { symbol, side, price } = req.body;
+
+    if (!symbol || !side) {
+      return res.status(400).send('Missing fields');
+    }
+
+    await bot.sendMessage(
+      CHAT_ID,
+      `🚨 TradingView Signal
+
+📊 ${symbol}
+📈 ${side}
+💵 Price: ${price || 'N/A'}`
+    );
+
+    res.send('OK');
+
+  } catch (err) {
+    console.log('Webhook error:', err.message);
+    res.status(500).send('ERROR');
+  }
+});
+
+const PUBLIC_URL =
+  process.env.PUBLIC_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '');
+
+const TELEGRAM_PATH =
+  `/telegram/${process.env.BOT_TOKEN}`;
+
+app.post(TELEGRAM_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  console.log(`Webhook server running on ${PORT}`);
+
+  if (PUBLIC_URL) {
+    try {
+      await bot.setWebHook(`${PUBLIC_URL}${TELEGRAM_PATH}`);
+      console.log('Telegram webhook set:', `${PUBLIC_URL}${TELEGRAM_PATH}`);
+    } catch (err) {
+      console.log('Telegram webhook error:', err.message);
+    }
+  } else {
+    console.log('PUBLIC_URL not set. Telegram commands will not work until webhook URL is set.');
+  }
+
+  startBot();
+});
+
 console.log('ST Gamma Radar is running...');
 
 async function startBot() {
@@ -1038,7 +1081,6 @@ async function startBot() {
   botStarted = true;
 
   try {
-    // أول قراءة فقط لتخزين الحالة، بدون إرسال
     if (isMarketTime()) {
       lastState = await buildState();
       console.log('Initial Gamma state loaded.');
@@ -1062,50 +1104,3 @@ async function startBot() {
     console.log('Bot startup error:', err.response?.data || err.message);
   }
 }
-
-const express = require('express');
-
-const app = express();
-
-app.use(express.json());
-
-app.post('/webhook', async (req, res) => {
-
-  try {
-
-    console.log('Webhook received:', req.body);
-
-    const {
-      symbol,
-      side,
-      price
-    } = req.body;
-
-    if (!symbol || !side) {
-      return res.status(400).send('Missing fields');
-    }
-
-    await bot.sendMessage(
-      CHAT_ID,
-      `🚨 TradingView Signal\n\n📊 ${symbol}\n📈 ${side}\n💵 Price: ${price || 'N/A'}`
-    );
-
-    res.send('OK');
-
-  } catch (err) {
-
-    console.log('Webhook error:', err.message);
-
-    res.status(500).send('ERROR');
-
-  }
-
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Webhook server running on ${PORT}`);
-});
-
-startBot();
