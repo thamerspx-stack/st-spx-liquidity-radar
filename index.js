@@ -70,6 +70,14 @@ function shortKsaTime() {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+function nyDateString() {
+  const d = nowNewYork();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function isMarketTime() {
   if (TEST_MODE) return true;
 
@@ -227,6 +235,45 @@ async function getOptionsChain(symbol) {
   return results;
 }
 
+async function getLiveSPXPrice() {
+  const today = nyDateString();
+
+  const urls = [
+    `${BASE_URL}/v3/snapshot/indices?ticker=I:SPX&apiKey=${API_KEY}`,
+    `${BASE_URL}/v3/snapshot/indices/I:SPX?apiKey=${API_KEY}`,
+    `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent('I:SPX')}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=1&apiKey=${API_KEY}`,
+    `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent('I:SPX')}/prev?adjusted=true&apiKey=${API_KEY}`
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url);
+      const body = res.data;
+
+      const candidates = [
+        body?.results?.[0]?.value,
+        body?.results?.[0]?.session?.close,
+        body?.results?.[0]?.session?.previous_close,
+        body?.results?.[0]?.c,
+        body?.results?.[0]?.vw,
+        body?.value,
+        body?.session?.close,
+        body?.session?.previous_close
+      ];
+
+      for (const p of candidates) {
+        if (p && Number(p) > 1000) {
+          return Number(p);
+        }
+      }
+    } catch (err) {
+      console.log('SPX live price fetch failed:', err.response?.data || err.message);
+    }
+  }
+
+  return null;
+}
+
 function getFallbackUnderlyingPrice(chain) {
   for (const c of chain) {
     const p =
@@ -360,6 +407,16 @@ function gammaFlipNearPrice(netByStrike, price) {
 }
 
 function getLevels(gamma, price) {
+  if (!price) {
+    return {
+      resistance1: null,
+      resistance2: null,
+      support1: null,
+      support2: null,
+      balance: null
+    };
+  }
+
   const callLevels = Array.from(gamma.callsMap.values())
     .filter(x => Math.abs(x.gamma) > 0)
     .sort((a, b) => a.strike - b.strike);
@@ -368,13 +425,13 @@ function getLevels(gamma, price) {
     .filter(x => Math.abs(x.gamma) > 0)
     .sort((a, b) => a.strike - b.strike);
 
-  const resistanceList = price
-    ? callLevels.filter(x => x.strike > price).sort((a, b) => a.strike - b.strike)
-    : [];
+  const resistanceList = callLevels
+    .filter(x => x.strike > price)
+    .sort((a, b) => a.strike - b.strike);
 
-  const supportList = price
-    ? putLevels.filter(x => x.strike < price).sort((a, b) => b.strike - a.strike)
-    : [];
+  const supportList = putLevels
+    .filter(x => x.strike < price)
+    .sort((a, b) => b.strike - a.strike);
 
   const sharedLevels = Array.from(gamma.callsMap.keys())
     .filter(strike => gamma.putsMap.has(strike))
@@ -387,7 +444,7 @@ function getLevels(gamma, price) {
         callGamma: Math.abs(call?.gamma || 0),
         putGamma: Math.abs(put?.gamma || 0),
         totalGamma: Math.abs(call?.gamma || 0) + Math.abs(put?.gamma || 0),
-        distance: price ? Math.abs(strike - price) : 0
+        distance: Math.abs(strike - price)
       };
     })
     .filter(x => x.totalGamma > 0)
@@ -395,15 +452,13 @@ function getLevels(gamma, price) {
 
   const balance = sharedLevels[0] || null;
 
-  let support1 = supportList[0] || null;
-  let support2 = supportList.find(x => !support1 || x.strike !== support1.strike) || null;
+  const resistance1 = resistanceList[0] || null;
+  const resistance2 =
+    resistanceList.find(x => !resistance1 || x.strike !== resistance1.strike) || null;
 
-  if (balance && support1 && support1.strike === balance.strike) {
-    support2 = supportList.find(x => x.strike < balance.strike) || null;
-  }
-
-  let resistance1 = resistanceList[0] || null;
-  let resistance2 = resistanceList.find(x => !resistance1 || x.strike !== resistance1.strike) || null;
+  const support1 = supportList[0] || null;
+  const support2 =
+    supportList.find(x => !support1 || x.strike !== support1.strike) || null;
 
   return {
     resistance1,
@@ -441,7 +496,7 @@ function levelLine(item) {
   return fmtLevel(item.strike);
 }
 
-function aiDeskSummary(flow, netGamma, levels, flip) {
+function aiDeskSummary(flow, netGamma, levels, flip, priceSource) {
   const balance = levels.balance?.strike;
   const resistance1 = levels.resistance1?.strike;
   const resistance2 = levels.resistance2?.strike;
@@ -449,6 +504,10 @@ function aiDeskSummary(flow, netGamma, levels, flip) {
   const support2 = levels.support2?.strike;
 
   let text = '';
+
+  if (priceSource !== 'live') {
+    text += `تنبيه: قراءة المستويات مبنية على سعر مرجعي غير لحظي، لذلك قد تتأخر عن حركة السوق السريعة.\n\n`;
+  }
 
   if (netGamma > 0 && flow.putPct > flow.callPct) {
     text += `السوق مستقر نسبيًا بسبب Positive Gamma، لكن تدفق PUT أعلى من CALL لذلك القراءة إيجابية بحذر.`;
@@ -463,7 +522,11 @@ function aiDeskSummary(flow, netGamma, levels, flip) {
   }
 
   if (balance) {
-    text += `\n\nالثبات فوق ${fmtLevel(balance)} يحافظ على التماسك.`;
+    text += `\n\nMagnet Zone الحالية عند ${fmtLevel(balance)}.`;
+  }
+
+  if (support1) {
+    text += `\nالثبات فوق ${fmtLevel(support1)} يحافظ على التماسك.`;
   }
 
   if (resistance1 && resistance2) {
@@ -483,6 +546,7 @@ function aiDeskSummary(flow, netGamma, levels, flip) {
 
 function buildSignature(data) {
   return [
+    data.price || 'NO_PRICE',
     data.netGamma,
     data.flow.callPct,
     data.flow.putPct,
@@ -497,7 +561,11 @@ function buildSignature(data) {
 
 async function buildReport() {
   const chain = await getOptionsChain('I:SPX');
-  const price = getFallbackUnderlyingPrice(chain);
+
+  const livePrice = await getLiveSPXPrice();
+  const fallbackPrice = getFallbackUnderlyingPrice(chain);
+  const price = livePrice || fallbackPrice;
+  const priceSource = livePrice ? 'live' : 'fallback';
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
@@ -506,6 +574,7 @@ async function buildReport() {
   const state = marketBiasByGamma(gamma.netGamma, flow);
 
   const data = {
+    price,
     netGamma: gamma.netGamma,
     flow,
     flip,
@@ -537,7 +606,7 @@ CALL ${flow.callPct}% | PUT ${flow.putPct}%
 ━━━━━━━━━━━━━━
 🧠 Desk Read
 
-${aiDeskSummary(flow, gamma.netGamma, levels, flip)}
+${aiDeskSummary(flow, gamma.netGamma, levels, flip, priceSource)}
 
 ━━━━━━━━━━━━━━
 ⚠️ متابعة تحليلية وليست توصية.
