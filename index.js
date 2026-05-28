@@ -497,18 +497,56 @@ function levelLine(item) {
   return fmtLevel(item.strike);
 }
 
-function aiDeskSummary(flow, netGamma, levels, priceSource) {
-  const balance = levels.balance?.strike;
+function gammaMeaning(netGamma, flip, balance) {
+  if (netGamma > 0) {
+    return `🟢 Positive Gamma
+بيئة السوق الحالية مستقرة نسبيًا والتذبذب تحت السيطرة.
+
+⚖️ Net Gamma: ${fmtCompact(netGamma)}
+دعم واضح من تمركز الـ Gamma لاستقرار الحركة الحالية.
+
+📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
+فوق هذا المستوى يبقى السوق أكثر توازنًا.
+كسره قد يزيد سرعة الحركة والتذبذب.
+
+🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}
+أعلى تمركز Gamma حاليًا،
+لذلك السوق يميل للانجذاب والتماسك حولها.`;
+  }
+
+  if (netGamma < 0) {
+    return `🔴 Negative Gamma
+بيئة السوق الحالية أكثر حساسية وقد تزيد فيها الحركة السريعة.
+
+⚖️ Net Gamma: ${fmtCompact(netGamma)}
+تمركز الـ Gamma سلبي، وهذا قد يزيد التذبذب.
+
+📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
+استعادة هذا المستوى قد تهدئ الحركة.
+البقاء تحته يعني ضغط وتذبذب أعلى.
+
+🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}
+أقرب منطقة جذب سعرية حاليًا.`;
+  }
+
+  return `🟡 Neutral Gamma
+السوق في وضع محايد ويحتاج تأكيد أوضح من السعر والتدفقات.
+
+⚖️ Net Gamma: ${fmtCompact(netGamma)}
+لا يوجد تفوق واضح في تمركز الـ Gamma.
+
+📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
+
+🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}`;
+}
+
+function aiDeskSummary(flow, netGamma, levels) {
   const resistance1 = levels.resistance1?.strike;
   const resistance2 = levels.resistance2?.strike;
   const support1 = levels.support1?.strike;
   const support2 = levels.support2?.strike;
 
   let text = '';
-
-  if (priceSource === 'none') {
-    text += `تنبيه: لم يتم جلب السعر اللحظي، لذلك قد تكون المستويات غير دقيقة.\n\n`;
-  }
 
   if (netGamma > 0 && flow.putPct > flow.callPct) {
     text += `السوق مستقر نسبيًا بسبب Positive Gamma، لكن تدفق PUT أعلى من CALL لذلك القراءة إيجابية بحذر.`;
@@ -522,12 +560,8 @@ function aiDeskSummary(flow, netGamma, levels, priceSource) {
     text += `السوق محايد، والقراءة تحتاج تأكيد أوضح من التدفقات.`;
   }
 
-  if (balance) {
-    text += `\n\nMagnet Zone الحالية عند ${fmtLevel(balance)}.`;
-  }
-
   if (support1) {
-    text += `\nالثبات فوق ${fmtLevel(support1)} يحافظ على التماسك.`;
+    text += `\n\nالثبات فوق ${fmtLevel(support1)} يحافظ على التماسك.`;
   }
 
   if (resistance1 && resistance2) {
@@ -567,7 +601,6 @@ async function buildReport() {
   const fallbackPrice = getFallbackUnderlyingPrice(chain);
 
   const price = livePrice || fallbackPrice;
-  const priceSource = livePrice ? 'live' : fallbackPrice ? 'option chain fallback' : 'none';
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
@@ -589,10 +622,7 @@ async function buildReport() {
 📡 ST Gamma Radar — SPX
 🕒 ${shortKsaTime()}
 
-${gamma.netGamma > 0 ? '🟢' : gamma.netGamma < 0 ? '🔴' : '🟡'} الحالة: ${state}
-⚖️ Net Gamma: ${fmtCompact(gamma.netGamma)}
-📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
-🧲 Magnet Zone: ${levels.balance ? fmtLevel(levels.balance.strike) : 'N/A'}
+${gammaMeaning(gamma.netGamma, flip, levels.balance?.strike)}
 
 ━━━━━━━━━━━━━━
 📌 المستويات المهمة
@@ -608,7 +638,7 @@ CALL ${flow.callPct}% | PUT ${flow.putPct}%
 ━━━━━━━━━━━━━━
 🧠 Desk Read
 
-${aiDeskSummary(flow, gamma.netGamma, levels, priceSource)}
+${aiDeskSummary(flow, gamma.netGamma, levels)}
 
 ━━━━━━━━━━━━━━
 ⚠️ متابعة تحليلية وليست توصية.
