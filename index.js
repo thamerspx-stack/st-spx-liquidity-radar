@@ -6,6 +6,11 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const API_KEY = process.env.MASSIVE_API_KEY;
 const CHAT_ID = process.env.SPX_CHAT_ID;
 
+const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
+  .split(',')
+  .map(x => x.trim())
+  .filter(Boolean);
+
 const BASE_URL = 'https://api.massive.com';
 
 const TEST_MODE = true;
@@ -15,6 +20,10 @@ const SEND_EVERY_MS = 15 * 60 * 1000;
 
 let lastSentSignature = '';
 let lastSentAt = 0;
+
+function isAdmin(msg) {
+  return ADMIN_IDS.includes(String(msg.from?.id || ''));
+}
 
 function fmt(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
@@ -282,6 +291,25 @@ async function scanAndSend() {
     console.error('SPX BOT ERROR:', err.response?.data || err.message);
   }
 }
+
+bot.onText(/\/admin/, async (msg) => {
+  if (!isAdmin(msg)) {
+    return bot.sendMessage(msg.chat.id, '❌ هذا الأمر خاص بالإدارة.');
+  }
+
+  return bot.sendMessage(
+    msg.chat.id,
+    `👑 لوحة الإدارة
+
+✅ البوت شغال
+🧪 TEST_MODE: ${TEST_MODE ? 'مفعل' : 'مغلق'}
+👤 عدد المدراء: ${ADMIN_IDS.length}
+
+الأوامر الحالية:
+/admin
+/status`
+  );
+});
 
 bot.onText(/\/status/, async (msg) => {
   await bot.sendMessage(
