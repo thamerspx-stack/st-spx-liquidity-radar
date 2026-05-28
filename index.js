@@ -35,9 +35,9 @@ function fmt(n) {
   return Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
-function fmtMoney(n) {
+function fmtLevel(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
-  return Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return Number(n).toLocaleString('en-US', { maximumFractionDigits: 1 });
 }
 
 function fmtCompact(n) {
@@ -63,6 +63,11 @@ function nowKsa() {
   return new Date(new Date().toLocaleString('en-US', {
     timeZone: 'Asia/Riyadh'
   }));
+}
+
+function shortKsaTime() {
+  const d = nowKsa();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 function isMarketTime() {
@@ -423,17 +428,17 @@ function flowSummary(callVolume, putVolume) {
 }
 
 function marketBiasByGamma(netGamma, flow) {
-  if (netGamma > 0 && flow.putPct >= 58) return '🟡 إيجابية حذرة';
-  if (netGamma > 0 && flow.callPct >= 58) return '🟢 إيجابية';
-  if (netGamma > 0) return '🟢 مستقرة';
-  if (netGamma < 0 && flow.putPct >= 58) return '🔴 سلبية متذبذبة';
-  if (netGamma < 0) return '🟠 متذبذبة';
-  return '🟡 محايدة';
+  if (netGamma > 0 && flow.putPct >= 58) return 'إيجابية بحذر';
+  if (netGamma > 0 && flow.callPct >= 58) return 'إيجابية';
+  if (netGamma > 0) return 'Positive Gamma';
+  if (netGamma < 0 && flow.putPct >= 58) return 'سلبية متذبذبة';
+  if (netGamma < 0) return 'Negative Gamma';
+  return 'محايدة';
 }
 
 function levelLine(item) {
-  if (!item) return 'غير متوفر';
-  return fmtMoney(item.strike);
+  if (!item) return 'N/A';
+  return fmtLevel(item.strike);
 }
 
 function aiDeskSummary(flow, netGamma, levels, flip) {
@@ -445,38 +450,32 @@ function aiDeskSummary(flow, netGamma, levels, flip) {
 
   let text = '';
 
-  if (netGamma > 0) {
-    text += `السوق ما زال داخل Positive Gamma Environment، وهذا يدعم الهدوء النسبي ويميل لتقليل التذبذب العنيف.`;
+  if (netGamma > 0 && flow.putPct > flow.callPct) {
+    text += `السوق مستقر نسبيًا بسبب Positive Gamma، لكن تدفق PUT أعلى من CALL لذلك القراءة إيجابية بحذر.`;
+  } else if (netGamma > 0 && flow.callPct > flow.putPct) {
+    text += `السوق داخل Positive Gamma مع تفوق CALL Flow، وهذا يدعم الزخم الإيجابي بشرط الثبات فوق الدعم.`;
+  } else if (netGamma > 0) {
+    text += `السوق داخل Positive Gamma، وهذا يدعم الهدوء النسبي وتقليل التذبذب العنيف.`;
   } else if (netGamma < 0) {
-    text += `السوق داخل Negative Gamma Environment، وهذا يرفع احتمالية الحركة العنيفة والتذبذب السريع.`;
+    text += `السوق داخل Negative Gamma، وهذا يرفع احتمالية الحركة العنيفة والتذبذب السريع.`;
   } else {
-    text += `السوق في وضع Gamma محايد، والقراءة تحتاج تأكيد من التدفقات والمستويات القريبة.`;
-  }
-
-  if (flow.putPct > flow.callPct) {
-    text += `\n\nلكن تدفقات PUT أعلى من CALL، وهذا يعني وجود ضغط تحوطي واضح وليس Risk-On كامل.`;
-  } else if (flow.callPct > flow.putPct) {
-    text += `\n\nتدفقات CALL أعلى من PUT، وهذا يدعم الزخم الإيجابي بشرط الثبات فوق مناطق الدعم.`;
+    text += `السوق محايد، والقراءة تحتاج تأكيد أوضح من التدفقات.`;
   }
 
   if (balance) {
-    text += `\n\nمنطقة ${fmtMoney(balance)} تعتبر Magnet Zone حالية بسبب تمركز CALL وPUT Gamma عليها.`;
+    text += `\n\nالثبات فوق ${fmtLevel(balance)} يحافظ على التماسك.`;
   }
 
   if (resistance1 && resistance2) {
-    text += `\n\n🟥 الثبات فوق ${fmtMoney(resistance1)} قد يدفع السعر لاختبار ${fmtMoney(resistance2)}.`;
+    text += `\nاختراق ${fmtLevel(resistance1)} يفتح الطريق نحو ${fmtLevel(resistance2)}.`;
   } else if (resistance1) {
-    text += `\n\n🟥 الثبات فوق ${fmtMoney(resistance1)} يدعم استمرار الزخم الصاعد.`;
+    text += `\nاختراق ${fmtLevel(resistance1)} يدعم استمرار الزخم الصاعد.`;
   }
 
   if (support1 && support2) {
-    text += `\n🟩 كسر ${fmtMoney(support1)} قد يفتح المجال لاختبار ${fmtMoney(support2)}.`;
+    text += `\nكسر ${fmtLevel(support1)} ثم ${fmtLevel(support2)} يزيد الضغط والتذبذب.`;
   } else if (support1) {
-    text += `\n🟩 كسر ${fmtMoney(support1)} يضعف القراءة الإيجابية ويفتح المجال لزيادة التذبذب.`;
-  }
-
-  if (flip) {
-    text += `\n\n📍 Gamma Flip: ${fmtMoney(flip)}`;
+    text += `\nكسر ${fmtLevel(support1)} يزيد الضغط والتذبذب.`;
   }
 
   return text;
@@ -516,39 +515,32 @@ async function buildReport() {
   const signature = buildSignature(data);
 
   const text = `
-📊 ST Gamma Radar — SPX
-🕒 ${nowKsa().toISOString().replace('T', ' ').slice(0, 19)}
-📈 الحالة: ${state}
+📡 ST Gamma Radar — SPX
+🕒 ${shortKsaTime()}
+
+${gamma.netGamma > 0 ? '🟢' : gamma.netGamma < 0 ? '🔴' : '🟡'} الحالة: ${state}
+⚖️ Net Gamma: ${fmtCompact(gamma.netGamma)}
+📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
+🧲 Magnet Zone: ${levels.balance ? fmtLevel(levels.balance.strike) : 'N/A'}
 
 ━━━━━━━━━━━━━━
-⚖️ Gamma
+📌 المستويات المهمة
 
-Net Gamma: ${fmtCompact(gamma.netGamma)}
-Gamma Flip: ${flip ? fmtMoney(flip) : 'غير متوفر'}
-Magnet Zone: ${levels.balance ? fmtMoney(levels.balance.strike) : 'غير متوفر'}
-
-━━━━━━━━━━━━━━
-📍 Key Levels
-
-🟥 مقاومات Gamma
-${levelLine(levels.resistance1)} → ${levelLine(levels.resistance2)}
-
-🟩 دعوم Gamma
-${levelLine(levels.support1)} → ${levelLine(levels.support2)}
+🟥 مقاومة: ${levelLine(levels.resistance1)} → ${levelLine(levels.resistance2)}
+🟩 دعم: ${levelLine(levels.support1)} → ${levelLine(levels.support2)}
 
 ━━━━━━━━━━━━━━
 🔥 Flow
 
-CALL: ${flow.callPct}%
-PUT: ${flow.putPct}%
+CALL ${flow.callPct}% | PUT ${flow.putPct}%
 
 ━━━━━━━━━━━━━━
-🧠 Desk Summary
+🧠 Desk Read
 
 ${aiDeskSummary(flow, gamma.netGamma, levels, flip)}
 
 ━━━━━━━━━━━━━━
-⚠️ متابعة تحليلية وليست توصية شراء أو بيع.
+⚠️ متابعة تحليلية وليست توصية.
 `;
 
   return { text, signature };
