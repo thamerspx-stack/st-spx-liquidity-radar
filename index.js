@@ -30,7 +30,12 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 // =====================
 
 const SYMBOL = 'SPX';
-const UNDERLYING_SYMBOL = 'I:SPX';
+
+// SPY للتحليل والسعر المرجعي
+const UNDERLYING_SYMBOL = 'SPY';
+
+// SPX للعقود فقط
+const OPTIONS_SYMBOL = 'I:SPX';
 
 const activeTrades = new Map();
 let botPaused = false;
@@ -52,9 +57,7 @@ const MAX_DTE = 1;
 const TAKE_PROFIT_PERCENT = 30;
 const STOP_LOSS_PERCENT = 22;
 
-const NEAR_TARGET_PERCENT = 15;
 const NEAR_STOP_PERCENT = -15;
-
 const UPDATE_STEP = 0.10;
 
 const MIN_TECHNICAL_SCORE = 65;
@@ -318,43 +321,61 @@ async function isMarketOpenNow() {
   }
 }
 
+// السعر المرجعي من SPY مضروب ×10 ليقارب SPX
 async function getSPXSnapshot() {
-  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
 
-  if (FINNHUB_KEY) {
-    const symbols = ['^GSPC', 'SPX'];
+    const url =
+      `https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(UNDERLYING_SYMBOL)}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=1&apiKey=${API_KEY}`;
 
-    for (const symbol of symbols) {
-      try {
-        const url =
-          `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
+    const data = await apiGet(url);
+    const r = data?.results?.[0];
 
-        const data = await apiGet(url);
-        const price = Number(data?.c);
-        const open = Number(data?.o);
-        const high = Number(data?.h);
-        const low = Number(data?.l);
+    if (r && Number(r.c) > 0) {
+      const spyPrice = Number(r.c);
+      const spxProxy = spyPrice * 10;
 
-        if (price && price > 1000) {
-          console.log(`Live SPX price from Finnhub ${symbol}: ${price}`);
-
-          return {
-            symbol: SYMBOL,
-            price,
-            open,
-            high,
-            low,
-            volume: 0,
-            change: open ? ((price - open) / open) * 100 : 0
-          };
-        }
-      } catch (err) {
-        console.log(`Finnhub SPX price failed ${symbol}:`, err.message);
-      }
+      return {
+        symbol: SYMBOL,
+        price: spxProxy,
+        open: Number(r.o) * 10,
+        high: Number(r.h) * 10,
+        low: Number(r.l) * 10,
+        volume: Number(r.v || 0),
+        change: r.o ? ((r.c - r.o) / r.o) * 100 : 0
+      };
     }
+  } catch (err) {
+    console.log('SPY live price failed:', err.message);
   }
 
-  console.log('⚠️ لم أستطع جلب سعر SPX من Finnhub.');
+  try {
+    const url =
+      `https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(UNDERLYING_SYMBOL)}/prev?adjusted=true&apiKey=${API_KEY}`;
+
+    const data = await apiGet(url);
+    const r = data?.results?.[0];
+
+    if (r && Number(r.c) > 0) {
+      const spyPrice = Number(r.c);
+      const spxProxy = spyPrice * 10;
+
+      return {
+        symbol: SYMBOL,
+        price: spxProxy,
+        open: Number(r.o) * 10,
+        high: Number(r.h) * 10,
+        low: Number(r.l) * 10,
+        volume: Number(r.v || 0),
+        change: r.o ? ((r.c - r.o) / r.o) * 100 : 0
+      };
+    }
+  } catch (err) {
+    console.log('SPY prev price failed:', err.message);
+  }
+
+  console.log('⚠️ لم أستطع جلب سعر SPX المرجعي من SPY.');
   return null;
 }
 
@@ -378,7 +399,7 @@ async function getIntradayCandles() {
 async function getOptionsChain() {
   let results = [];
   let url =
-    `https://api.massive.com/v3/snapshot/options/${encodeURIComponent(UNDERLYING_SYMBOL)}?limit=250&apiKey=${API_KEY}`;
+    `https://api.massive.com/v3/snapshot/options/${encodeURIComponent(OPTIONS_SYMBOL)}?limit=250&apiKey=${API_KEY}`;
 
   for (let i = 0; i < 12; i++) {
     const data = await apiGet(url);
@@ -397,7 +418,7 @@ async function getOptionsChain() {
 
 async function getOptionSnapshot(contractTicker) {
   const url =
-    `https://api.massive.com/v3/snapshot/options/${encodeURIComponent(UNDERLYING_SYMBOL)}/${encodeURIComponent(contractTicker)}?apiKey=${API_KEY}`;
+    `https://api.massive.com/v3/snapshot/options/${encodeURIComponent(OPTIONS_SYMBOL)}/${encodeURIComponent(contractTicker)}?apiKey=${API_KEY}`;
 
   const data = await apiGet(url);
 
@@ -533,7 +554,6 @@ function getRecentRange(candles, length = 10) {
     low: Math.min(...recent.map(c => Number(c.l)))
   };
 }
-
 async function getTechnicalBias() {
   try {
     const candles = await getIntradayCandles();
@@ -634,6 +654,7 @@ async function getTechnicalBias() {
     };
   }
 }
+
 // =====================
 // Contract Scoring
 // =====================
@@ -774,7 +795,6 @@ function getFlowBias(chain, stock) {
     putScore
   };
 }
-
 function isCandidateContract(item, stock, technicalBias, flowBias) {
   const type = getContractType(item);
   const mid = getMidPrice(item);
@@ -957,6 +977,7 @@ function selectBestContract(stock, chain, technicalBias) {
     nearStopSent: false
   };
 }
+
 // =====================
 // Supabase
 // =====================
@@ -1108,7 +1129,6 @@ async function loadOpenTradesFromSupabase() {
     console.error('Load Open Trades Error:', err.message);
   }
 }
-
 // =====================
 // Trade Messages
 // =====================
@@ -1349,6 +1369,7 @@ async function sendStopHit(trade) {
 
   await sendToSignals(text);
 }
+
 // =====================
 // Trade Updates
 // =====================
@@ -1412,7 +1433,6 @@ async function refreshTradeData(trade) {
 
   return Number(current.toFixed(2));
 }
-
 async function updateActiveTrades() {
   for (const [key, trade] of activeTrades.entries()) {
     try {
@@ -1760,6 +1780,7 @@ bot.onText(/\/stoptrade/, async (msg) => {
     '🛑 تم إغلاق صفقة SPX يدويًا.'
   );
 });
+
 // =====================
 // Safety Logs
 // =====================
