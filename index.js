@@ -14,7 +14,6 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 const BASE_URL = 'https://api.massive.com';
 
 const TEST_MODE = true;
-
 const TOP_N = 5;
 const INTERVAL_MS = 5 * 60 * 1000;
 const SEND_EVERY_MS = 15 * 60 * 1000;
@@ -58,19 +57,22 @@ function isMarketTime() {
 }
 
 async function getSPXPrice() {
-  const symbols = ['I:SPX', 'SPX'];
+  const queries = [
+    `${BASE_URL}/v3/snapshot/indices?ticker=I:SPX&apiKey=${API_KEY}`,
+    `${BASE_URL}/v3/snapshot/indices?ticker=SPX&apiKey=${API_KEY}`
+  ];
 
-  for (const symbol of symbols) {
+  for (const url of queries) {
     try {
-      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(symbol)}/prev?adjusted=true&apiKey=${API_KEY}`;
       const res = await axios.get(url);
-      const price = res.data?.results?.[0]?.c;
+      const item = res.data?.results?.[0];
+      const price = item?.value || item?.session?.close || item?.session?.previous_close;
 
       if (price && Number(price) > 1000) {
         return Number(price);
       }
     } catch (err) {
-      console.log(`Price fetch failed for ${symbol}:`, err.response?.data || err.message);
+      console.log('SPX price fetch failed:', err.response?.data || err.message);
     }
   }
 
@@ -93,6 +95,19 @@ async function getOptionsChain(symbol) {
   }
 
   return results;
+}
+
+function getFallbackUnderlyingPrice(chain) {
+  for (const c of chain) {
+    const p =
+      c?.underlying_asset?.price ||
+      c?.underlying_asset?.last_price ||
+      c?.underlying_asset?.value;
+
+    if (p && Number(p) > 1000) return Number(p);
+  }
+
+  return null;
 }
 
 function calcGexRaw(contract) {
@@ -188,7 +203,7 @@ function gammaFlipNearPrice(netByStrike, price) {
   if (!levelsAll.length) return null;
 
   const levels = price
-    ? levelsAll.filter(x => x.strike >= price * 0.75 && x.strike <= price * 1.25)
+    ? levelsAll.filter(x => x.strike >= price * 0.9 && x.strike <= price * 1.1)
     : levelsAll;
 
   if (!levels.length) return null;
@@ -383,7 +398,12 @@ function buildSignature(data) {
 
 async function buildReport() {
   const chain = await getOptionsChain('I:SPX');
-  const price = await getSPXPrice();
+
+  let price = await getSPXPrice();
+
+  if (!price) {
+    price = getFallbackUnderlyingPrice(chain);
+  }
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
