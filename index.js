@@ -156,7 +156,9 @@ async function redeemCode(code, user) {
       ? new Date(sub.expires_at)
       : now;
 
-  const expiresAt = new Date(baseDate.getTime() + accessCode.days * 24 * 60 * 60 * 1000);
+  const expiresAt = new Date(
+    baseDate.getTime() + accessCode.days * 24 * 60 * 60 * 1000
+  );
 
   const { error: upsertError } = await supabase
     .from('subscriptions')
@@ -303,6 +305,53 @@ function aggregateGammaByStrike(chain) {
   };
 }
 
+function gammaFlipNearPrice(netByStrike, price) {
+  const levelsAll = Array.from(netByStrike.entries())
+    .map(([strike, gamma]) => ({ strike: Number(strike), gamma: Number(gamma) }))
+    .filter(x => x.strike > 0 && x.gamma !== 0)
+    .sort((a, b) => a.strike - b.strike);
+
+  if (!levelsAll.length) return null;
+
+  const levels = price
+    ? levelsAll.filter(x => x.strike >= price * 0.9 && x.strike <= price * 1.1)
+    : levelsAll;
+
+  if (!levels.length) return null;
+
+  let best = null;
+
+  for (let i = 1; i < levels.length; i++) {
+    const prev = levels[i - 1];
+    const curr = levels[i];
+
+    const crossed =
+      (prev.gamma < 0 && curr.gamma > 0) ||
+      (prev.gamma > 0 && curr.gamma < 0);
+
+    if (crossed) {
+      const mid = (prev.strike + curr.strike) / 2;
+      const distance = price ? Math.abs(mid - price) : Math.abs(mid);
+
+      if (!best || distance < best.distance) {
+        best = { strike: mid, distance };
+      }
+    }
+  }
+
+  if (best) return best.strike;
+
+  const nearestSmallestAbs = levels
+    .map(x => ({
+      strike: x.strike,
+      distance: price ? Math.abs(x.strike - price) : Math.abs(x.strike),
+      absGamma: Math.abs(x.gamma)
+    }))
+    .sort((a, b) => a.distance - b.distance || a.absGamma - b.absGamma)[0];
+
+  return nearestSmallestAbs?.strike || null;
+}
+
 function nearestGammaLevels(gamma, price) {
   if (!price) {
     return { resistance: null, support: null, balance: null };
@@ -399,31 +448,45 @@ CALL Gamma: ${fmt(item.callGamma)}
 PUT Gamma: -${fmt(item.putGamma)}`;
 }
 
-function aiSummary(flow, netGamma, nearest) {
+function aiSummary(flow, netGamma, nearest, flip) {
   const resistance = nearest?.resistance?.strike;
   const support = nearest?.support?.strike;
   const balance = nearest?.balance?.strike;
 
+  const callPct = flow.callPct;
+  const putPct = flow.putPct;
+
+  let summary = '';
+
   if (netGamma > 0) {
-    return `Net Gamma إيجابي، وهذا يعطي بيئة أكثر استقرارًا.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
+    summary += `Net Gamma ما زال إيجابيًا، وهذا يدعم استقرار الحركة الحالية ويقلل احتمالية التذبذب العنيف`;
+  } else if (netGamma < 0) {
+    summary += `Net Gamma سلبي، وهذا يعني أن السوق قابل لحركة أكثر عنفًا وتذبذبًا`;
+  } else {
+    summary += `Net Gamma محايد تقريبًا، والسوق يحتاج تأكيد أوضح من التدفقات`;
   }
 
-  if (netGamma < 0) {
-    return `Net Gamma سلبي، لذلك السوق قابل لحركة عنيفة حتى لو كانت التدفقات متوازنة.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
+  if (flip) {
+    summary += ` مع مراقبة Gamma Flip عند ${fmtMoney(flip)}.`;
+  } else {
+    summary += `.`;
   }
 
-  return `السوق حاليًا في وضع متوازن نسبيًا.
+  summary += `\n\nمنطقة ${fmtMoney(balance)} تعتبر حاليًا Magnet Zone رئيسية بسبب تمركز CALL وPUT Gamma عليها، لذلك السوق قد يميل للتماسك حولها.`;
 
-سيطرة الكول: ${flow.callPct}%
-سيطرة البوت: ${flow.putPct}%`;
+  summary += `\n\n🟥 اختراق ${fmtMoney(resistance)} قد يدفع السعر نحو مناطق Gamma أعلى ويدعم استمرار الزخم الصاعد.`;
+
+  summary += `\n\n🟩 كسر ${fmtMoney(balance)} ثم ${fmtMoney(support)} يضعف القراءة الإيجابية ويفتح المجال لزيادة التذبذب والضغط البيعي.`;
+
+  if (putPct > callPct) {
+    summary += `\n\n⚠️ رغم إيجابية Net Gamma، ما زالت تدفقات PUT أعلى قليلًا من CALL، لذلك السوق لم يدخل مرحلة Risk-On الكاملة حتى الآن.`;
+  } else if (callPct > putPct) {
+    summary += `\n\n✅ تدفقات CALL أعلى من PUT، وهذا يدعم القراءة الإيجابية بشرط استمرار الثبات فوق مناطق الدعم.`;
+  } else {
+    summary += `\n\n⚠️ التدفقات متوازنة بين CALL وPUT، لذلك الأفضل عدم اعتبار الحركة مؤكدة حتى يظهر تفوق واضح لأحد الطرفين.`;
+  }
+
+  return summary;
 }
 
 function buildSignature(data) {
@@ -431,6 +494,7 @@ function buildSignature(data) {
     data.netGamma,
     data.flow.callPct,
     data.flow.putPct,
+    data.flip || 'NO_FLIP',
     data.topCalls.map(x => x.strike).join(','),
     data.topPuts.map(x => x.strike).join(','),
     data.nearest?.resistance?.strike || 'NO_RES',
@@ -446,11 +510,13 @@ async function buildReport() {
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
   const nearest = nearestGammaLevels(gamma, price);
+  const flip = gammaFlipNearPrice(gamma.netByStrike, price);
   const state = marketBiasByGamma(gamma.netGamma, flow);
 
   const data = {
     netGamma: gamma.netGamma,
     flow,
+    flip,
     topCalls: gamma.topCalls,
     topPuts: gamma.topPuts,
     nearest
@@ -495,6 +561,11 @@ Total Put Gamma: ${fmt(gamma.totalPutGamma)}
 Net Gamma: ${fmt(gamma.netGamma)}
 
 ━━━━━━━━━━━━━━
+🎯 Gamma Flip
+
+المستوى الأقرب للسعر: ${flip ? fmtMoney(flip) : 'غير متوفر'}
+
+━━━━━━━━━━━━━━
 🔥 Options Flow
 
 🟢 سيطرة الكول: ${flow.callPct}%
@@ -511,7 +582,7 @@ ${liquidityText(flow, gamma.netGamma)}
 ━━━━━━━━━━━━━━
 🤖 AI Market Summary
 
-${aiSummary(flow, gamma.netGamma, nearest)}
+${aiSummary(flow, gamma.netGamma, nearest, flip)}
 
 ━━━━━━━━━━━━━━
 ⚠️ هذه متابعة تحليلية وليست توصية شراء أو بيع.
