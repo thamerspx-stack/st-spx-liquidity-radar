@@ -51,22 +51,36 @@ function isMarketTime() {
   return minutes >= open && minutes <= close;
 }
 
-async function getSpyPrice() {
-  const url = `${BASE_URL}/v2/aggs/ticker/SPY/prev?adjusted=true&apiKey=${API_KEY}`;
-  const res = await axios.get(url);
-  return res.data?.results?.[0]?.c || null;
+async function getSpxPrice() {
+  const tickers = ['I:SPX', 'SPX'];
+
+  for (const ticker of tickers) {
+    try {
+      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev?adjusted=true&apiKey=${API_KEY}`;
+      const res = await axios.get(url);
+      const price = res.data?.results?.[0]?.c;
+      if (price) return price;
+    } catch (e) {
+      console.log(`Price failed for ${ticker}`);
+    }
+  }
+
+  return null;
 }
 
 async function getOptionsChain(symbol) {
   let results = [];
   let url = `${BASE_URL}/v3/snapshot/options/${symbol}?limit=250&apiKey=${API_KEY}`;
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 6; i++) {
     const res = await axios.get(url);
     results = results.concat(res.data?.results || []);
 
     if (!res.data?.next_url) break;
-    url = `${res.data.next_url}&apiKey=${API_KEY}`;
+
+    url = res.data.next_url.includes('apiKey=')
+      ? res.data.next_url
+      : `${res.data.next_url}&apiKey=${API_KEY}`;
   }
 
   return results;
@@ -76,7 +90,9 @@ function calcGex(contract) {
   const gamma = Number(contract?.greeks?.gamma || 0);
   const oi = Number(contract?.open_interest || 0);
   const strike = Number(contract?.details?.strike_price || 0);
-  const type = contract?.details?.contract_type;
+  const type = String(contract?.details?.contract_type || '').toLowerCase();
+
+  if (!gamma || !oi || !strike) return 0;
 
   let gex = gamma * oi * 100 * strike;
 
@@ -87,12 +103,13 @@ function calcGex(contract) {
 
 function topGamma(chain, type) {
   return chain
-    .filter(c => c?.details?.contract_type === type)
+    .filter(c => String(c?.details?.contract_type || '').toLowerCase() === type)
     .map(c => ({
-      strike: c.details.strike_price,
+      strike: c.details?.strike_price,
       gex: calcGex(c),
-      volume: c.day?.volume || 0,
-      oi: c.open_interest || 0
+      gamma: Number(c?.greeks?.gamma || 0),
+      volume: Number(c?.day?.volume || 0),
+      oi: Number(c?.open_interest || 0)
     }))
     .filter(x => x.strike && Math.abs(x.gex) > 0)
     .sort((a, b) => Math.abs(b.gex) - Math.abs(a.gex))
@@ -103,14 +120,20 @@ function gammaFlip(chain) {
   const levels = {};
 
   for (const c of chain) {
-    const strike = c?.details?.strike_price;
+    const strike = Number(c?.details?.strike_price || 0);
     if (!strike) continue;
-    levels[strike] = (levels[strike] || 0) + calcGex(c);
+
+    const gex = calcGex(c);
+    if (!gex) continue;
+
+    levels[strike] = (levels[strike] || 0) + gex;
   }
 
   const sorted = Object.entries(levels)
     .map(([strike, gex]) => ({ strike: Number(strike), gex }))
     .sort((a, b) => a.strike - b.strike);
+
+  if (!sorted.length) return null;
 
   let cumulative = 0;
 
@@ -127,7 +150,7 @@ function flowSummary(chain) {
   let putVolume = 0;
 
   for (const c of chain) {
-    const type = c?.details?.contract_type;
+    const type = String(c?.details?.contract_type || '').toLowerCase();
     const volume = Number(c?.day?.volume || 0);
 
     if (type === 'call') callVolume += volume;
@@ -143,36 +166,42 @@ function flowSummary(chain) {
   if (callPct >= 58) bias = 'إيجابي';
   if (putPct >= 58) bias = 'سلبي';
 
-  return { callPct, putPct, bias };
+  return { callPct, putPct, bias, callVolume, putVolume };
 }
 
-function institutionalText(flow) {
+function liquidityText(flow) {
   if (flow.bias === 'إيجابي') {
-    return `تم رصد تدفقات CALL مؤسسية على SPY و QQQ،
-مما يدعم استمرار الزخم الإيجابي في السوق.`;
+    return `تم رصد تفوق واضح في تدفقات CALL على عقود SPX،
+مما يدعم الزخم الإيجابي الحالي بشرط ثبات السعر فوق مناطق الدعم.`;
   }
 
   if (flow.bias === 'سلبي') {
-    return `تم رصد زيادة في تدفقات PUT على SPY و QQQ،
-مع استمرار الضغط البيعي وضعف الزخم الصاعد.`;
+    return `تم رصد تفوق واضح في تدفقات PUT على عقود SPX،
+مما يعكس ضغطًا بيعيًا وحذرًا في حركة السوق الحالية.`;
   }
 
-  return `التدفقات المؤسسية على SPY و QQQ متوازنة حاليًا،
+  return `تدفقات عقود SPX متوازنة حاليًا بين CALL و PUT،
 ولا توجد سيطرة واضحة مع استمرار التذبذب العرضي.`;
 }
 
-function aiSummary(price, flip, flow, topCall, topPut) {
+function aiSummary(price, flip, flow, topCall, topPut, hasGamma) {
+  if (!hasGamma) {
+    return `بيانات GEX / Gamma غير متوفرة حاليًا من الاشتراك أو من مزود البيانات.
+
+القراءة الحالية مبنية فقط على حجم تدفق العقود CALL / PUT، لذلك لا يتم اعتماد Gamma Flip حتى تتوفر بيانات Greeks.`;
+  }
+
   if (!flip) return 'لا توجد قراءة كافية حاليًا لتحديد Gamma Flip.';
 
   if (price > flip && flow.bias === 'إيجابي') {
-    return `السوق يميل للإيجابية طالما السعر فوق Gamma Flip ${fmt(flip)}.
+    return `السوق يميل للإيجابية طالما SPX فوق Gamma Flip ${fmt(flip)}.
 
 اختراق ${fmt(topCall?.strike)} قد يدعم استمرار الزخم الصاعد،
 بينما كسر ${fmt(topPut?.strike)} قد يضعف القراءة الإيجابية.`;
   }
 
   if (price < flip && flow.bias === 'سلبي') {
-    return `السوق يميل للسلبية طالما السعر تحت Gamma Flip ${fmt(flip)}.
+    return `السوق يميل للسلبية طالما SPX تحت Gamma Flip ${fmt(flip)}.
 
 الثبات تحت ${fmt(flip)} يبقي الضغط البيعي قائمًا،
 وأقرب منطقة دفاع مهمة عند ${fmt(topPut?.strike)}.`;
@@ -184,17 +213,31 @@ function aiSummary(price, flip, flow, topCall, topPut) {
 والأفضل مراقبة Gamma Flip عند ${fmt(flip)} قبل ترجيح الاتجاه.`;
 }
 
+function gexLine(item, type) {
+  if (!item) {
+    return `${type} N/A
+📊 GEX Exposure: غير متوفر`;
+  }
+
+  const sign = type === 'CALL' ? '+' : '-';
+
+  return `${type} ${item.strike}
+📊 GEX Exposure: ${sign}${fmt(Math.abs(item.gex))}`;
+}
+
 function buildSignature(data) {
   return [
     data.flow.bias,
-    data.flip,
-    data.calls.map(x => x.strike).join(','),
-    data.puts.map(x => x.strike).join(',')
+    data.flip || 'NO_FLIP',
+    data.calls.map(x => x.strike).join(',') || 'NO_CALL_GEX',
+    data.puts.map(x => x.strike).join(',') || 'NO_PUT_GEX',
+    data.flow.callPct,
+    data.flow.putPct
   ].join('|');
 }
 
 async function buildReport() {
-  const price = await getSpyPrice();
+  const price = await getSpxPrice();
   const spxChain = await getOptionsChain('SPX');
 
   const calls = topGamma(spxChain, 'call');
@@ -202,8 +245,14 @@ async function buildReport() {
   const flip = gammaFlip(spxChain);
   const flow = flowSummary(spxChain);
 
+  const hasGamma = calls.length > 0 || puts.length > 0 || flip !== null;
+
   const data = { price, calls, puts, flip, flow };
   const signature = buildSignature(data);
+
+  const gammaStatus = hasGamma
+    ? `${price && flip ? (price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma Flip 🔻') : 'تحتاج قراءة إضافية لتأكيد موقع السعر'}`
+    : 'بيانات Gamma غير متوفرة من مزود البيانات حاليًا ⚠️';
 
   const text = `
 🧠 ST SPX Liquidity Radar
@@ -215,33 +264,27 @@ async function buildReport() {
 ━━━━━━━━━━━━━━
 🟩 أعلى Gamma CALLS
 
-1. CALL ${calls[0]?.strike || 'N/A'}
-📊 GEX Exposure: +${fmt(Math.abs(calls[0]?.gex || 0))}
+1. ${gexLine(calls[0], 'CALL')}
 
-2. CALL ${calls[1]?.strike || 'N/A'}
-📊 GEX Exposure: +${fmt(Math.abs(calls[1]?.gex || 0))}
+2. ${gexLine(calls[1], 'CALL')}
 
-3. CALL ${calls[2]?.strike || 'N/A'}
-📊 GEX Exposure: +${fmt(Math.abs(calls[2]?.gex || 0))}
+3. ${gexLine(calls[2], 'CALL')}
 
 ━━━━━━━━━━━━━━
 🟥 أعلى Gamma PUTS
 
-1. PUT ${puts[0]?.strike || 'N/A'}
-📊 GEX Exposure: -${fmt(Math.abs(puts[0]?.gex || 0))}
+1. ${gexLine(puts[0], 'PUT')}
 
-2. PUT ${puts[1]?.strike || 'N/A'}
-📊 GEX Exposure: -${fmt(Math.abs(puts[1]?.gex || 0))}
+2. ${gexLine(puts[1], 'PUT')}
 
-3. PUT ${puts[2]?.strike || 'N/A'}
-📊 GEX Exposure: -${fmt(Math.abs(puts[2]?.gex || 0))}
+3. ${gexLine(puts[2], 'PUT')}
 
 ━━━━━━━━━━━━━━
 🎯 Gamma Flip
 
-📍 المستوى: ${fmt(flip)}
+📍 المستوى: ${flip ? fmt(flip) : 'غير متوفر'}
 
-${price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma Flip 🔻'}
+${gammaStatus}
 
 ━━━━━━━━━━━━━━
 🔥 Options Flow
@@ -249,15 +292,18 @@ ${price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma F
 🟢 سيطرة الكول: ${flow.callPct}%
 🔴 سيطرة البوت: ${flow.putPct}%
 
+حجم CALL: ${fmt(flow.callVolume)}
+حجم PUT: ${fmt(flow.putVolume)}
+
 ━━━━━━━━━━━━━━
 🌑 السيولة المؤسسية
 
-${institutionalText(flow)}
+${liquidityText(flow)}
 
 ━━━━━━━━━━━━━━
 🤖 AI Market Summary
 
-${aiSummary(price, flip, flow, calls[0], puts[0])}
+${aiSummary(price, flip, flow, calls[0], puts[0], hasGamma)}
 
 ━━━━━━━━━━━━━━
 ⚠️ هذه متابعة تحليلية وليست توصية شراء أو بيع.
@@ -266,7 +312,7 @@ ${aiSummary(price, flip, flow, calls[0], puts[0])}
   return { text, signature };
 }
 
-async function scanAndSend() {
+async function scanAndSend(force = false) {
   try {
     if (!isMarketTime()) {
       console.log('Market closed. Skipping scan.');
@@ -279,7 +325,7 @@ async function scanAndSend() {
     const changed = signature !== lastSentSignature;
     const timePassed = now - lastSentAt >= SEND_EVERY_MS;
 
-    if (changed || timePassed) {
+    if (force || changed || timePassed) {
       await bot.sendMessage(CHAT_ID, text);
       lastSentSignature = signature;
       lastSentAt = now;
@@ -307,7 +353,8 @@ bot.onText(/\/admin/, async (msg) => {
 
 الأوامر الحالية:
 /admin
-/status`
+/status
+/test`
   );
 });
 
@@ -320,7 +367,16 @@ bot.onText(/\/status/, async (msg) => {
   );
 });
 
-scanAndSend();
+bot.onText(/\/test/, async (msg) => {
+  if (!isAdmin(msg)) {
+    return bot.sendMessage(msg.chat.id, '❌ هذا الأمر خاص بالإدارة.');
+  }
+
+  await bot.sendMessage(msg.chat.id, '⏳ جاري إرسال تقرير تجريبي...');
+  await scanAndSend(true);
+});
+
+scanAndSend(true);
 setInterval(scanAndSend, INTERVAL_MS);
 
 console.log('ST SPX Liquidity Radar is running...');
