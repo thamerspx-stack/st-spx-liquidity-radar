@@ -1063,4 +1063,49 @@ async function startBot() {
   }
 }
 
+const express = require('express');
+
+const app = express();
+
+app.use(express.json());
+
+app.post('/webhook', async (req, res) => {
+
+  try {
+
+    console.log('Webhook received:', req.body);
+
+    const {
+      symbol,
+      side,
+      price
+    } = req.body;
+
+    if (!symbol || !side) {
+      return res.status(400).send('Missing fields');
+    }
+
+    await bot.sendMessage(
+      CHAT_ID,
+      `🚨 TradingView Signal\n\n📊 ${symbol}\n📈 ${side}\n💵 Price: ${price || 'N/A'}`
+    );
+
+    res.send('OK');
+
+  } catch (err) {
+
+    console.log('Webhook error:', err.message);
+
+    res.status(500).send('ERROR');
+
+  }
+
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Webhook server running on ${PORT}`);
+});
+
 startBot();
