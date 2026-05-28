@@ -319,36 +319,42 @@ async function isMarketOpenNow() {
 }
 
 async function getSPXSnapshot() {
-  const today = new Date().toISOString().slice(0, 10);
+  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
-  const urls = [
-    `https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(UNDERLYING_SYMBOL)}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=1&apiKey=${API_KEY}`,
-    `https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(UNDERLYING_SYMBOL)}/prev?adjusted=true&apiKey=${API_KEY}`
-  ];
+  if (FINNHUB_KEY) {
+    const symbols = ['^GSPC', 'SPX'];
 
-  for (const url of urls) {
-    try {
-      const data = await apiGet(url);
-      const r = data?.results?.[0];
+    for (const symbol of symbols) {
+      try {
+        const url =
+          `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
 
-      if (!r) continue;
+        const data = await apiGet(url);
+        const price = Number(data?.c);
+        const open = Number(data?.o);
+        const high = Number(data?.h);
+        const low = Number(data?.l);
 
-      const change = r.o ? ((r.c - r.o) / r.o) * 100 : null;
+        if (price && price > 1000) {
+          console.log(`Live SPX price from Finnhub ${symbol}: ${price}`);
 
-      return {
-        symbol: SYMBOL,
-        price: Number(r.c),
-        open: Number(r.o),
-        high: Number(r.h),
-        low: Number(r.l),
-        volume: Number(r.v || 0),
-        change
-      };
-    } catch (err) {
-      console.log('SPX Snapshot Error:', err.message);
+          return {
+            symbol: SYMBOL,
+            price,
+            open,
+            high,
+            low,
+            volume: 0,
+            change: open ? ((price - open) / open) * 100 : 0
+          };
+        }
+      } catch (err) {
+        console.log(`Finnhub SPX price failed ${symbol}:`, err.message);
+      }
     }
   }
 
+  console.log('⚠️ لم أستطع جلب سعر SPX من Finnhub.');
   return null;
 }
 
