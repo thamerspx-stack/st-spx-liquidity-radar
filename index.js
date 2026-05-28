@@ -27,11 +27,16 @@ const supabase = createClient(
 const BASE_URL = 'https://api.massive.com';
 
 const TEST_MODE = false;
-const INTERVAL_MS = 5 * 60 * 1000;
-const SEND_EVERY_MS = 15 * 60 * 1000;
 
-let lastSentSignature = '';
-let lastSentAt = 0;
+// يفحص كل دقيقة، لكن لا يرسل إلا عند تغيير مهم
+const INTERVAL_MS = 60 * 1000;
+
+// منع تكرار نفس التنبيه بسرعة
+const ALERT_COOLDOWN_MS = 5 * 60 * 1000;
+
+let lastState = null;
+let lastAlertSignature = '';
+let lastAlertAt = 0;
 let botStarted = false;
 let intervalStarted = false;
 
@@ -46,6 +51,7 @@ function fmtLevel(n) {
 
 function fmtCompact(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
+
   const abs = Math.abs(Number(n));
   const sign = Number(n) >= 0 ? '+' : '-';
 
@@ -489,63 +495,269 @@ function levelLine(item) {
   return fmtLevel(item.strike);
 }
 
-function marketScenario(netGamma, flow, levels, flip) {
-  const balance = levels.balance?.strike;
-  const resistance1 = levels.resistance1?.strike;
-  const resistance2 = levels.resistance2?.strike;
-  const support1 = levels.support1?.strike;
-  const support2 = levels.support2?.strike;
-
-  const gammaState =
-    netGamma > 0
-      ? `🟢 السوق ما زال ثابت فوق Gamma Flip ${flip ? fmtLevel(flip) : 'N/A'}\nوهذا يحافظ على هدوء الحركة الحالية.`
-      : netGamma < 0
-        ? `🔴 السوق في بيئة Gamma سلبية\nوهذا يزيد احتمالية الحركة السريعة والتذبذب.`
-        : `🟡 السوق في وضع Gamma محايد\nويحتاج تأكيد أوضح من التدفقات.`;
-
-  const flowText =
-    flow.callPct > flow.putPct
-      ? `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nتدفق الكول أعلى حاليًا، وهذا يدعم الزخم الإيجابي بشرط الثبات فوق الدعم.`
-      : flow.putPct > flow.callPct
-        ? `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nتدفق البوت أعلى حاليًا، لذلك أي كسر للدعم قد يرفع التذبذب بسرعة.`
-        : `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nالتدفقات متوازنة، ولا يوجد اندفاع مؤسسي واضح حتى الآن.`;
-
-  const scenario =
-`السوق حاليًا “Pinned” حول ${balance ? fmtLevel(balance) : 'N/A'}،
-ولهذا الحركة أبطأ وأكثر تماسكًا.
-
-فوق ${resistance1 ? fmtLevel(resistance1) : 'N/A'}
-قد يبدأ تسارع إيجابي نحو ${resistance2 ? fmtLevel(resistance2) : 'N/A'}.
-
-تحت ${support1 ? fmtLevel(support1) : 'N/A'}
-يبدأ ضعف التماسك وترتفع احتمالية التذبذب السريع.
-
-أي خروج واضح من هذا النطاق
-قد يغيّر سلوك السوق بسرعة.`;
-
-  return {
-    gammaState,
-    flowText,
-    scenario
-  };
+function buildCurrentState() {
+  return null;
 }
 
-function buildSignature(data) {
+function buildSignature(state) {
   return [
-    data.price || 'NO_PRICE',
-    data.netGamma,
-    data.flow.callPct,
-    data.flow.putPct,
-    data.flip || 'NO_FLIP',
-    data.levels?.resistance1?.strike || 'NO_R1',
-    data.levels?.resistance2?.strike || 'NO_R2',
-    data.levels?.support1?.strike || 'NO_S1',
-    data.levels?.support2?.strike || 'NO_S2',
-    data.levels?.balance?.strike || 'NO_BAL'
+    state.price || 'NO_PRICE',
+    state.netGamma,
+    state.flow.callPct,
+    state.flow.putPct,
+    state.flip || 'NO_FLIP',
+    state.levels?.resistance1?.strike || 'NO_R1',
+    state.levels?.resistance2?.strike || 'NO_R2',
+    state.levels?.support1?.strike || 'NO_S1',
+    state.levels?.support2?.strike || 'NO_S2',
+    state.levels?.balance?.strike || 'NO_BAL'
   ].join('|');
 }
 
-async function buildReport() {
+function detectAlert(prev, curr) {
+  if (!prev) {
+    return {
+      type: 'INIT',
+      title: '📡 ST Gamma Radar — SPX',
+      shouldSend: false
+    };
+  }
+
+  const price = curr.price;
+  const prevPrice = prev.price;
+
+  const magnet = curr.levels.balance?.strike;
+  const prevMagnet = prev.levels.balance?.strike;
+
+  const flip = curr.flip;
+  const prevFlip = prev.flip;
+
+  const resistance1 = curr.levels.resistance1?.strike;
+  const resistance2 = curr.levels.resistance2?.strike;
+  const support1 = curr.levels.support1?.strike;
+  const support2 = curr.levels.support2?.strike;
+
+  const prevCall = prev.flow.callPct;
+  const prevPut = prev.flow.putPct;
+  const call = curr.flow.callPct;
+  const put = curr.flow.putPct;
+
+  const netGammaChangePct =
+    prev.netGamma && curr.netGamma
+      ? Math.abs((curr.netGamma - prev.netGamma) / prev.netGamma) * 100
+      : 0;
+
+  const crossedAboveMagnet =
+    magnet && prevPrice && price && prevPrice < magnet && price >= magnet;
+
+  const crossedBelowMagnet =
+    magnet && prevPrice && price && prevPrice > magnet && price <= magnet;
+
+  const crossedBelowFlip =
+    flip && prevPrice && price && prevPrice > flip && price <= flip;
+
+  const crossedAboveFlip =
+    flip && prevPrice && price && prevPrice < flip && price >= flip;
+
+  const magnetChanged =
+    magnet && prevMagnet && magnet !== prevMagnet;
+
+  const flowShiftToCall =
+    call >= 58 && prevCall < 58;
+
+  const flowShiftToPut =
+    put >= 58 && prevPut < 58;
+
+  const nearResistance =
+    resistance1 && price && Math.abs(price - resistance1) <= 2;
+
+  const nearSupport =
+    support1 && price && Math.abs(price - support1) <= 2;
+
+  if (crossedBelowFlip) {
+    return {
+      type: 'FLIP_BREAKDOWN',
+      shouldSend: true,
+      title: '⚠️ Volatility Alert — SPX',
+      text:
+`السعر كسر Gamma Flip عند ${fmtLevel(flip)}.
+
+🔴 هذا قد يرفع سرعة الحركة والتذبذب.
+
+المناطق الأقرب:
+${fmtLevel(support1)} → ${fmtLevel(support2)}
+
+أي عودة فوق ${fmtLevel(flip)} تهدئ القراءة.`
+    };
+  }
+
+  if (crossedAboveFlip) {
+    return {
+      type: 'FLIP_RECOVERY',
+      shouldSend: true,
+      title: '🟢 Gamma Recovery — SPX',
+      text:
+`السعر استعاد Gamma Flip عند ${fmtLevel(flip)}.
+
+هذا يعيد السوق إلى بيئة أكثر توازنًا.
+
+المقاومات الأقرب:
+${fmtLevel(resistance1)} → ${fmtLevel(resistance2)}`
+    };
+  }
+
+  if (crossedAboveMagnet) {
+    return {
+      type: 'MAGNET_BREAKOUT',
+      shouldSend: true,
+      title: '🚨 Gamma Breakout — SPX',
+      text:
+`السعر اخترق Magnet Zone عند ${fmtLevel(magnet)}.
+
+🟢 هذا يدعم امتداد الحركة نحو:
+${fmtLevel(resistance1)} → ${fmtLevel(resistance2)}
+
+⚠️ العودة تحت ${fmtLevel(magnet)} تضعف الزخم.`
+    };
+  }
+
+  if (crossedBelowMagnet) {
+    return {
+      type: 'MAGNET_REJECTION',
+      shouldSend: true,
+      title: '⚠️ Gamma Rejection — SPX',
+      text:
+`السعر فشل في الثبات فوق Magnet Zone عند ${fmtLevel(magnet)}.
+
+هذا قد يعيد السوق للتماسك أو الضغط نحو:
+${fmtLevel(support1)} → ${fmtLevel(support2)}
+
+اختراق ${fmtLevel(magnet)} مرة أخرى يعيد الزخم.`
+    };
+  }
+
+  if (magnetChanged) {
+    return {
+      type: 'MAGNET_SHIFT',
+      shouldSend: true,
+      title: '🧲 Magnet Shift — SPX',
+      text:
+`تغيرت منطقة الجذب الرئيسية:
+
+من ${fmtLevel(prevMagnet)}
+إلى ${fmtLevel(magnet)}
+
+هذا يعني أن تمركز Gamma انتقل،
+وقد يبدأ السوق بالتماسك حول المنطقة الجديدة.`
+    };
+  }
+
+  if (flowShiftToCall) {
+    return {
+      type: 'CALL_FLOW_SHIFT',
+      shouldSend: true,
+      title: '🟢 Flow Shift — SPX',
+      text:
+`CALL Flow ارتفع إلى ${call}%.
+
+هذا يدعم الزخم الإيجابي بشرط الثبات فوق:
+${fmtLevel(support1)}
+
+الأهداف الأقرب:
+${fmtLevel(resistance1)} → ${fmtLevel(resistance2)}`
+    };
+  }
+
+  if (flowShiftToPut) {
+    return {
+      type: '🔴 PUT_FLOW_SHIFT',
+      shouldSend: true,
+      title: '🔴 Flow Shift — SPX',
+      text:
+`PUT Flow ارتفع إلى ${put}%.
+
+هذا يعني أن التحوط أو الضغط البيعي بدأ يزيد.
+
+كسر ${fmtLevel(support1)} قد يفتح الطريق نحو:
+${fmtLevel(support2)}`
+    };
+  }
+
+  if (nearResistance) {
+    return {
+      type: 'NEAR_RESISTANCE',
+      shouldSend: true,
+      title: '🟥 Gamma Resistance Test — SPX',
+      text:
+`السعر يختبر مقاومة Gamma عند ${fmtLevel(resistance1)}.
+
+اختراقها قد يدفع السوق نحو:
+${fmtLevel(resistance2)}
+
+الفشل عندها قد يعيد السعر نحو:
+${fmtLevel(support1)}`
+    };
+  }
+
+  if (nearSupport) {
+    return {
+      type: 'NEAR_SUPPORT',
+      shouldSend: true,
+      title: '🟩 Gamma Support Test — SPX',
+      text:
+`السعر يختبر دعم Gamma عند ${fmtLevel(support1)}.
+
+الثبات فوقه يحافظ على التماسك.
+
+كسره قد يرفع التذبذب نحو:
+${fmtLevel(support2)}`
+    };
+  }
+
+  if (netGammaChangePct >= 15) {
+    return {
+      type: 'NET_GAMMA_CHANGE',
+      shouldSend: true,
+      title: '⚖️ Net Gamma Shift — SPX',
+      text:
+`تغير واضح في Net Gamma.
+
+السابق: ${fmtCompact(prev.netGamma)}
+الحالي: ${fmtCompact(curr.netGamma)}
+
+هذا يعني تغيرًا في قوة استقرار السوق أو حساسية الحركة.`
+    };
+  }
+
+  return {
+    type: 'NO_ALERT',
+    shouldSend: false
+  };
+}
+
+function buildAlertMessage(alert, state) {
+  return `
+${alert.title}
+🕒 ${shortKsaTime()}
+
+${alert.text}
+
+━━━━━━━━━━━━━━
+📊 الحالة الحالية
+
+Price: ${state.price ? fmtLevel(state.price) : 'N/A'}
+Net Gamma: ${fmtCompact(state.netGamma)}
+Gamma Flip: ${state.flip ? fmtLevel(state.flip) : 'N/A'}
+Magnet: ${state.levels.balance ? fmtLevel(state.levels.balance.strike) : 'N/A'}
+
+CALL ${state.flow.callPct}% | PUT ${state.flow.putPct}%
+
+━━━━━━━━━━━━━━
+⚠️ متابعة تحليلية وليست توصية.
+`;
+}
+
+async function buildState() {
   const chain = await getOptionsChain('I:SPX');
 
   const livePrice = await getLiveSPXPrice();
@@ -557,53 +769,43 @@ async function buildReport() {
   const levels = getLevels(gamma, price);
   const flip = gammaFlipNearPrice(gamma.netByStrike, price);
 
-  const scenario = marketScenario(gamma.netGamma, flow, levels, flip);
-
-  const data = {
+  return {
     price,
     netGamma: gamma.netGamma,
     flow,
-    flip,
-    levels
+    levels,
+    flip
   };
+}
 
-  const signature = buildSignature(data);
+async function buildSnapshotReport() {
+  const state = await buildState();
 
   const text = `
 📡 ST Gamma Radar — SPX
 🕒 ${shortKsaTime()}
 
-${scenario.gammaState}
+🟢/🔴 الحالة حسب Gamma:
+Net Gamma: ${fmtCompact(state.netGamma)}
+Gamma Flip: ${state.flip ? fmtLevel(state.flip) : 'N/A'}
+Magnet: ${state.levels.balance ? fmtLevel(state.levels.balance.strike) : 'N/A'}
 
 ━━━━━━━━━━━━━━
-🎯 أهم منطقة بالسوق الآن:
-${levels.balance ? fmtLevel(levels.balance.strike) : 'N/A'}
+📌 المستويات المهمة
 
-السوق ينجذب لها بشكل واضح،
-لأنها أعلى تمركز Gamma حاليًا.
-
-━━━━━━━━━━━━━━
-🟥 فوق ${levelLine(levels.resistance1)}
-قد يبدأ تسارع إيجابي نحو ${levelLine(levels.resistance2)}
-
-🟩 تحت ${levelLine(levels.support1)}
-يبدأ ضعف التماسك وترتفع احتمالية التذبذب السريع.
+🟥 مقاومة: ${levelLine(state.levels.resistance1)} → ${levelLine(state.levels.resistance2)}
+🟩 دعم: ${levelLine(state.levels.support1)} → ${levelLine(state.levels.support2)}
 
 ━━━━━━━━━━━━━━
-🔥 Flow الحالي
+🔥 Flow
 
-${scenario.flowText}
-
-━━━━━━━━━━━━━━
-🧠 القراءة الحالية
-
-${scenario.scenario}
+CALL ${state.flow.callPct}% | PUT ${state.flow.putPct}%
 
 ━━━━━━━━━━━━━━
 ⚠️ متابعة تحليلية وليست توصية.
 `;
 
-  return { text, signature };
+  return { text, state };
 }
 
 async function sendReportToActiveSubscribers(text) {
@@ -627,33 +829,46 @@ async function sendReportToActiveSubscribers(text) {
   }
 }
 
-async function scanAndSend(force = false, targetChatId = null) {
+async function scanAndAlert(force = false, targetChatId = null) {
   try {
     if (!isMarketTime()) {
       console.log('Market closed. Skipping scan.');
       return;
     }
 
-    const { text, signature } = await buildReport();
+    if (force && targetChatId) {
+      const snapshot = await buildSnapshotReport();
+      await bot.sendMessage(targetChatId, snapshot.text);
+      lastState = snapshot.state;
+      return;
+    }
 
-    if (targetChatId) {
-      await bot.sendMessage(targetChatId, text);
+    const curr = await buildState();
+    const alert = detectAlert(lastState, curr);
+    const signature = alert.type + '|' + buildSignature(curr);
+
+    lastState = curr;
+
+    if (!alert.shouldSend) {
+      console.log('No important Gamma alert.');
       return;
     }
 
     const now = Date.now();
-    const changed = signature !== lastSentSignature;
-    const timePassed = now - lastSentAt >= SEND_EVERY_MS;
 
-    if (!force && !changed && !timePassed) {
-      console.log('No important change. Skipping message.');
+    if (signature === lastAlertSignature && now - lastAlertAt < ALERT_COOLDOWN_MS) {
+      console.log('Duplicate alert skipped.');
       return;
     }
 
-    await sendReportToActiveSubscribers(text);
-    lastSentSignature = signature;
-    lastSentAt = now;
-    console.log('SPX report sent.');
+    const msg = buildAlertMessage(alert, curr);
+
+    await sendReportToActiveSubscribers(msg);
+
+    lastAlertSignature = signature;
+    lastAlertAt = now;
+
+    console.log('Gamma alert sent:', alert.type);
 
   } catch (err) {
     console.error('SPX BOT ERROR:', err.response?.data || err.message);
@@ -664,6 +879,9 @@ bot.onText(/\/start/, async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
     `هلا بك في ST Gamma Radar.
+
+البوت لا يرسل رسائل مكررة كل 5 دقائق.
+يرسل فقط عند وجود تغير مهم في Gamma / Flow / Magnet / Flip.
 
 لتفعيل الاشتراك:
 أرسل كود الاشتراك مباشرة هنا.
@@ -777,6 +995,9 @@ bot.onText(/\/admin/, async (msg) => {
 👤 عدد المدراء: ${ADMIN_IDS.length}
 ✅ المشتركين النشطين: ${subscribers.length}
 
+وضع التشغيل:
+Alerts only
+
 الأوامر:
 /create 30
 /my
@@ -791,8 +1012,8 @@ bot.onText(/\/status/, async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
     `✅ ST Gamma Radar شغال
-⏱ الفحص كل 5 دقائق
-🧪 TEST_MODE: ${TEST_MODE ? 'مفعل' : 'مغلق'}
+⚡ الوضع: Alerts only
+⏱ الفحص كل دقيقة
 🔐 اشتراكك: ${active ? 'فعال ✅' : 'غير فعال ❌'}`
   );
 });
@@ -802,8 +1023,8 @@ bot.onText(/\/test/, async (msg) => {
     return bot.sendMessage(msg.chat.id, '❌ هذا الأمر خاص بالإدارة.');
   }
 
-  await bot.sendMessage(msg.chat.id, '⏳ جاري إرسال تقرير تجريبي...');
-  await scanAndSend(true, msg.chat.id);
+  await bot.sendMessage(msg.chat.id, '⏳ جاري إرسال Snapshot تجريبي...');
+  await scanAndAlert(true, msg.chat.id);
 });
 
 console.log('ST Gamma Radar is running...');
@@ -817,21 +1038,25 @@ async function startBot() {
   botStarted = true;
 
   try {
-    await scanAndSend(false);
+    // أول قراءة فقط لتخزين الحالة، بدون إرسال
+    if (isMarketTime()) {
+      lastState = await buildState();
+      console.log('Initial Gamma state loaded.');
+    }
 
     if (!intervalStarted) {
       intervalStarted = true;
 
       setInterval(async () => {
         try {
-          await scanAndSend(false);
+          await scanAndAlert(false);
         } catch (err) {
           console.log('Interval scan error:', err.response?.data || err.message);
         }
       }, INTERVAL_MS);
     }
 
-    console.log('Gamma Radar loop started.');
+    console.log('Gamma alert loop started.');
 
   } catch (err) {
     console.log('Bot startup error:', err.response?.data || err.message);
