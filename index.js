@@ -4,10 +4,10 @@ const { createClient } = require('@supabase/supabase-js');
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-console.log("Telegram bot connected");
+console.log('Telegram bot connected');
 
-bot.on("message", (msg) => {
-  console.log("Message:", msg.text);
+bot.on('message', (msg) => {
+  console.log('Message:', msg.text);
 });
 
 const API_KEY = process.env.MASSIVE_API_KEY;
@@ -46,7 +46,6 @@ function fmtLevel(n) {
 
 function fmtCompact(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
-
   const abs = Math.abs(Number(n));
   const sign = Number(n) >= 0 ? '+' : '-';
 
@@ -490,86 +489,45 @@ function levelLine(item) {
   return fmtLevel(item.strike);
 }
 
-function gammaMeaning(netGamma, flip, balance) {
-  if (netGamma > 0) {
-    return `🟢 Positive Gamma
-بيئة السوق الحالية مستقرة نسبيًا والتذبذب تحت السيطرة.
-
-⚖️ Net Gamma: ${fmtCompact(netGamma)}
-دعم واضح من تمركز الـ Gamma لاستقرار الحركة الحالية.
-
-📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
-فوق هذا المستوى يبقى السوق أكثر توازنًا.
-كسره قد يزيد سرعة الحركة والتذبذب.
-
-🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}
-أعلى تمركز Gamma حاليًا،
-لذلك السوق يميل للانجذاب والتماسك حولها.`;
-  }
-
-  if (netGamma < 0) {
-    return `🔴 Negative Gamma
-بيئة السوق الحالية أكثر حساسية وقد تزيد فيها الحركة السريعة.
-
-⚖️ Net Gamma: ${fmtCompact(netGamma)}
-تمركز الـ Gamma سلبي، وهذا قد يزيد التذبذب.
-
-📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
-استعادة هذا المستوى قد تهدئ الحركة.
-البقاء تحته يعني ضغط وتذبذب أعلى.
-
-🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}
-أقرب منطقة جذب سعرية حاليًا.`;
-  }
-
-  return `🟡 Neutral Gamma
-السوق في وضع محايد ويحتاج تأكيد أوضح من السعر والتدفقات.
-
-⚖️ Net Gamma: ${fmtCompact(netGamma)}
-لا يوجد تفوق واضح في تمركز الـ Gamma.
-
-📍 Gamma Flip: ${flip ? fmtLevel(flip) : 'N/A'}
-
-🧲 Magnet Zone: ${balance ? fmtLevel(balance) : 'N/A'}`;
-}
-
-function aiDeskSummary(flow, netGamma, levels) {
+function marketScenario(netGamma, flow, levels, flip) {
+  const balance = levels.balance?.strike;
   const resistance1 = levels.resistance1?.strike;
   const resistance2 = levels.resistance2?.strike;
   const support1 = levels.support1?.strike;
   const support2 = levels.support2?.strike;
 
-  let text = '';
+  const gammaState =
+    netGamma > 0
+      ? `🟢 السوق ما زال ثابت فوق Gamma Flip ${flip ? fmtLevel(flip) : 'N/A'}\nوهذا يحافظ على هدوء الحركة الحالية.`
+      : netGamma < 0
+        ? `🔴 السوق في بيئة Gamma سلبية\nوهذا يزيد احتمالية الحركة السريعة والتذبذب.`
+        : `🟡 السوق في وضع Gamma محايد\nويحتاج تأكيد أوضح من التدفقات.`;
 
-  if (netGamma > 0 && flow.putPct > flow.callPct) {
-    text += `السوق مستقر نسبيًا بسبب Positive Gamma، لكن تدفق PUT أعلى من CALL لذلك القراءة إيجابية بحذر.`;
-  } else if (netGamma > 0 && flow.callPct > flow.putPct) {
-    text += `السوق داخل Positive Gamma مع تفوق CALL Flow، وهذا يدعم الزخم الإيجابي بشرط الثبات فوق الدعم.`;
-  } else if (netGamma > 0) {
-    text += `السوق داخل Positive Gamma، وهذا يدعم الهدوء النسبي وتقليل التذبذب العنيف.`;
-  } else if (netGamma < 0) {
-    text += `السوق داخل Negative Gamma، وهذا يرفع احتمالية الحركة العنيفة والتذبذب السريع.`;
-  } else {
-    text += `السوق محايد، والقراءة تحتاج تأكيد أوضح من التدفقات.`;
-  }
+  const flowText =
+    flow.callPct > flow.putPct
+      ? `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nتدفق الكول أعلى حاليًا، وهذا يدعم الزخم الإيجابي بشرط الثبات فوق الدعم.`
+      : flow.putPct > flow.callPct
+        ? `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nتدفق البوت أعلى حاليًا، لذلك أي كسر للدعم قد يرفع التذبذب بسرعة.`
+        : `CALL ${flow.callPct}%\nPUT ${flow.putPct}%\n\nالتدفقات متوازنة، ولا يوجد اندفاع مؤسسي واضح حتى الآن.`;
 
-  if (support1) {
-    text += `\n\nالثبات فوق ${fmtLevel(support1)} يحافظ على التماسك.`;
-  }
+  const scenario =
+`السوق حاليًا “Pinned” حول ${balance ? fmtLevel(balance) : 'N/A'}،
+ولهذا الحركة أبطأ وأكثر تماسكًا.
 
-  if (resistance1 && resistance2) {
-    text += `\nاختراق ${fmtLevel(resistance1)} يفتح الطريق نحو ${fmtLevel(resistance2)}.`;
-  } else if (resistance1) {
-    text += `\nاختراق ${fmtLevel(resistance1)} يدعم استمرار الزخم الصاعد.`;
-  }
+فوق ${resistance1 ? fmtLevel(resistance1) : 'N/A'}
+قد يبدأ تسارع إيجابي نحو ${resistance2 ? fmtLevel(resistance2) : 'N/A'}.
 
-  if (support1 && support2) {
-    text += `\nكسر ${fmtLevel(support1)} ثم ${fmtLevel(support2)} يزيد الضغط والتذبذب.`;
-  } else if (support1) {
-    text += `\nكسر ${fmtLevel(support1)} يزيد الضغط والتذبذب.`;
-  }
+تحت ${support1 ? fmtLevel(support1) : 'N/A'}
+يبدأ ضعف التماسك وترتفع احتمالية التذبذب السريع.
 
-  return text;
+أي خروج واضح من هذا النطاق
+قد يغيّر سلوك السوق بسرعة.`;
+
+  return {
+    gammaState,
+    flowText,
+    scenario
+  };
 }
 
 function buildSignature(data) {
@@ -599,6 +557,8 @@ async function buildReport() {
   const levels = getLevels(gamma, price);
   const flip = gammaFlipNearPrice(gamma.netByStrike, price);
 
+  const scenario = marketScenario(gamma.netGamma, flow, levels, flip);
+
   const data = {
     price,
     netGamma: gamma.netGamma,
@@ -613,23 +573,31 @@ async function buildReport() {
 📡 ST Gamma Radar — SPX
 🕒 ${shortKsaTime()}
 
-${gammaMeaning(gamma.netGamma, flip, levels.balance?.strike)}
+${scenario.gammaState}
 
 ━━━━━━━━━━━━━━
-📌 المستويات المهمة
+🎯 أهم منطقة بالسوق الآن:
+${levels.balance ? fmtLevel(levels.balance.strike) : 'N/A'}
 
-🟥 مقاومة: ${levelLine(levels.resistance1)} → ${levelLine(levels.resistance2)}
-🟩 دعم: ${levelLine(levels.support1)} → ${levelLine(levels.support2)}
-
-━━━━━━━━━━━━━━
-🔥 Flow
-
-CALL ${flow.callPct}% | PUT ${flow.putPct}%
+السوق ينجذب لها بشكل واضح،
+لأنها أعلى تمركز Gamma حاليًا.
 
 ━━━━━━━━━━━━━━
-🧠 Desk Read
+🟥 فوق ${levelLine(levels.resistance1)}
+قد يبدأ تسارع إيجابي نحو ${levelLine(levels.resistance2)}
 
-${aiDeskSummary(flow, gamma.netGamma, levels)}
+🟩 تحت ${levelLine(levels.support1)}
+يبدأ ضعف التماسك وترتفع احتمالية التذبذب السريع.
+
+━━━━━━━━━━━━━━
+🔥 Flow الحالي
+
+${scenario.flowText}
+
+━━━━━━━━━━━━━━
+🧠 القراءة الحالية
+
+${scenario.scenario}
 
 ━━━━━━━━━━━━━━
 ⚠️ متابعة تحليلية وليست توصية.
@@ -640,20 +608,21 @@ ${aiDeskSummary(flow, gamma.netGamma, levels)}
 
 async function sendReportToActiveSubscribers(text) {
   const subscribers = await getActiveSubscribers();
+  const targets = new Set();
 
   for (const sub of subscribers) {
-    try {
-      await bot.sendMessage(sub.user_id, text);
-    } catch (err) {
-      console.error(`Failed to send to ${sub.user_id}:`, err.message);
-    }
+    if (sub.user_id) targets.add(String(sub.user_id));
   }
 
   if (CHAT_ID) {
+    targets.add(String(CHAT_ID));
+  }
+
+  for (const chatId of targets) {
     try {
-      await bot.sendMessage(CHAT_ID, text);
+      await bot.sendMessage(chatId, text);
     } catch (err) {
-      console.error('Failed to send to CHAT_ID:', err.message);
+      console.error(`Failed to send to ${chatId}:`, err.message);
     }
   }
 }
@@ -836,10 +805,6 @@ bot.onText(/\/test/, async (msg) => {
   await bot.sendMessage(msg.chat.id, '⏳ جاري إرسال تقرير تجريبي...');
   await scanAndSend(true, msg.chat.id);
 });
-
-// =====================
-// Start Bot
-// =====================
 
 console.log('ST Gamma Radar is running...');
 
