@@ -57,6 +57,26 @@ function isMarketTime() {
   return minutes >= open && minutes <= close;
 }
 
+async function getSPXPrice() {
+  const symbols = ['I:SPX', 'SPX'];
+
+  for (const symbol of symbols) {
+    try {
+      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(symbol)}/prev?adjusted=true&apiKey=${API_KEY}`;
+      const res = await axios.get(url);
+      const price = res.data?.results?.[0]?.c;
+
+      if (price && Number(price) > 1000) {
+        return Number(price);
+      }
+    } catch (err) {
+      console.log(`Price fetch failed for ${symbol}:`, err.response?.data || err.message);
+    }
+  }
+
+  return null;
+}
+
 async function getOptionsChain(symbol) {
   let results = [];
   let url = `${BASE_URL}/v3/snapshot/options/${encodeURIComponent(symbol)}?limit=250&apiKey=${API_KEY}`;
@@ -73,19 +93,6 @@ async function getOptionsChain(symbol) {
   }
 
   return results;
-}
-
-function getUnderlyingPrice(chain) {
-  for (const c of chain) {
-    const p =
-      c?.underlying_asset?.price ||
-      c?.underlying_asset?.last_price ||
-      c?.underlying_asset?.value;
-
-    if (p && Number(p) > 0) return Number(p);
-  }
-
-  return null;
 }
 
 function calcGexRaw(contract) {
@@ -221,11 +228,7 @@ function gammaFlipNearPrice(netByStrike, price) {
 
 function nearestGammaLevels(gamma, price) {
   if (!price) {
-    return {
-      resistance: null,
-      support: null,
-      balance: null
-    };
+    return { resistance: null, support: null, balance: null };
   }
 
   const callLevels = Array.from(gamma.callsMap.values())
@@ -380,8 +383,7 @@ function buildSignature(data) {
 
 async function buildReport() {
   const chain = await getOptionsChain('I:SPX');
-
-  const price = getUnderlyingPrice(chain);
+  const price = await getSPXPrice();
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
