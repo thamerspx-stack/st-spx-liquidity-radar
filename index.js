@@ -15,6 +15,7 @@ const BASE_URL = 'https://api.massive.com';
 
 const TEST_MODE = true;
 
+const TOP_N = 5;
 const INTERVAL_MS = 5 * 60 * 1000;
 const SEND_EVERY_MS = 15 * 60 * 1000;
 
@@ -28,6 +29,11 @@ function isAdmin(msg) {
 function fmt(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
   return Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+function fmtMoney(n) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return 'N/A';
+  return `$${Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
 }
 
 function nowKsa() {
@@ -51,29 +57,11 @@ function isMarketTime() {
   return minutes >= open && minutes <= close;
 }
 
-async function getSpxPrice() {
-  const symbols = ['I:SPX', 'SPX'];
-
-  for (const symbol of symbols) {
-    try {
-      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(symbol)}/prev?adjusted=true&apiKey=${API_KEY}`;
-      const res = await axios.get(url);
-      const price = res.data?.results?.[0]?.c;
-
-      if (price) return price;
-    } catch (err) {
-      console.log(`Price failed for ${symbol}:`, err.response?.data || err.message);
-    }
-  }
-
-  return null;
-}
-
 async function getOptionsChain(symbol) {
   let results = [];
   let url = `${BASE_URL}/v3/snapshot/options/${encodeURIComponent(symbol)}?limit=250&apiKey=${API_KEY}`;
 
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 12; i++) {
     const res = await axios.get(url);
     results = results.concat(res.data?.results || []);
 
@@ -87,77 +75,149 @@ async function getOptionsChain(symbol) {
   return results;
 }
 
-function calcGex(contract) {
-  const gamma = Number(contract?.greeks?.gamma || 0);
-  const oi = Number(contract?.open_interest || 0);
-  const strike = Number(contract?.details?.strike_price || 0);
-  const type = String(contract?.details?.contract_type || '').toLowerCase();
-
-  if (!gamma || !oi || !strike) return 0;
-
-  let gex = gamma * oi * 100 * strike;
-
-  if (type === 'put') gex *= -1;
-
-  return gex;
-}
-
-function topGamma(chain, type) {
-  return chain
-    .filter(c => String(c?.details?.contract_type || '').toLowerCase() === type)
-    .map(c => ({
-      strike: c.details?.strike_price,
-      gex: calcGex(c),
-      gamma: Number(c?.greeks?.gamma || 0),
-      volume: Number(c?.day?.volume || 0),
-      oi: Number(c?.open_interest || 0)
-    }))
-    .filter(x => x.strike && Math.abs(x.gex) > 0)
-    .sort((a, b) => Math.abs(b.gex) - Math.abs(a.gex))
-    .slice(0, 3);
-}
-
-function gammaFlip(chain) {
-  const levels = {};
-
+function getUnderlyingPrice(chain) {
   for (const c of chain) {
-    const strike = Number(c?.details?.strike_price || 0);
-    if (!strike) continue;
+    const p =
+      c?.underlying_asset?.price ||
+      c?.underlying_asset?.last_price ||
+      c?.underlying_asset?.value;
 
-    const gex = calcGex(c);
-    if (!gex) continue;
-
-    levels[strike] = (levels[strike] || 0) + gex;
-  }
-
-  const sorted = Object.entries(levels)
-    .map(([strike, gex]) => ({ strike: Number(strike), gex }))
-    .sort((a, b) => a.strike - b.strike);
-
-  if (!sorted.length) return null;
-
-  let cumulative = 0;
-
-  for (const lvl of sorted) {
-    cumulative += lvl.gex;
-    if (cumulative > 0) return lvl.strike;
+    if (p && Number(p) > 0) return Number(p);
   }
 
   return null;
 }
 
-function flowSummary(chain) {
+function calcGexRaw(contract) {
+  const gamma = Number(contract?.greeks?.gamma || 0);
+  const oi = Number(contract?.open_interest || 0);
+  const strike = Number(contract?.details?.strike_price || 0);
+
+  if (!gamma || !oi || !strike) return 0;
+
+  return gamma * oi * 100 * strike;
+}
+
+function contractType(contract) {
+  return String(contract?.details?.contract_type || '').toLowerCase();
+}
+
+function aggregateGammaByStrike(chain) {
+  const calls = new Map();
+  const puts = new Map();
+  const netByStrike = new Map();
+
+  let totalCallGamma = 0;
+  let totalPutGamma = 0;
   let callVolume = 0;
   let putVolume = 0;
 
   for (const c of chain) {
-    const type = String(c?.details?.contract_type || '').toLowerCase();
+    const type = contractType(c);
+    const strike = Number(c?.details?.strike_price || 0);
     const volume = Number(c?.day?.volume || 0);
+    const oi = Number(c?.open_interest || 0);
+    const gammaRaw = calcGexRaw(c);
 
-    if (type === 'call') callVolume += volume;
-    if (type === 'put') putVolume += volume;
+    if (!strike) continue;
+
+    if (type === 'call') {
+      callVolume += volume;
+      totalCallGamma += gammaRaw;
+
+      const old = calls.get(strike) || { strike, gamma: 0, volume: 0, oi: 0 };
+      old.gamma += gammaRaw;
+      old.volume += volume;
+      old.oi += oi;
+      calls.set(strike, old);
+
+      netByStrike.set(strike, (netByStrike.get(strike) || 0) + gammaRaw);
+    }
+
+    if (type === 'put') {
+      putVolume += volume;
+      totalPutGamma -= gammaRaw;
+
+      const old = puts.get(strike) || { strike, gamma: 0, volume: 0, oi: 0 };
+      old.gamma -= gammaRaw;
+      old.volume += volume;
+      old.oi += oi;
+      puts.set(strike, old);
+
+      netByStrike.set(strike, (netByStrike.get(strike) || 0) - gammaRaw);
+    }
   }
 
+  const topCalls = Array.from(calls.values())
+    .filter(x => Math.abs(x.gamma) > 0)
+    .sort((a, b) => Math.abs(b.gamma) - Math.abs(a.gamma))
+    .slice(0, TOP_N);
+
+  const topPuts = Array.from(puts.values())
+    .filter(x => Math.abs(x.gamma) > 0)
+    .sort((a, b) => Math.abs(b.gamma) - Math.abs(a.gamma))
+    .slice(0, TOP_N);
+
+  return {
+    topCalls,
+    topPuts,
+    totalCallGamma,
+    totalPutGamma,
+    netGamma: totalCallGamma + totalPutGamma,
+    callVolume,
+    putVolume,
+    netByStrike
+  };
+}
+
+function gammaFlipNearPrice(netByStrike, price) {
+  const levelsAll = Array.from(netByStrike.entries())
+    .map(([strike, gamma]) => ({ strike: Number(strike), gamma: Number(gamma) }))
+    .filter(x => x.strike > 0 && x.gamma !== 0)
+    .sort((a, b) => a.strike - b.strike);
+
+  if (!levelsAll.length) return null;
+
+  const levels = price
+    ? levelsAll.filter(x => x.strike >= price * 0.75 && x.strike <= price * 1.25)
+    : levelsAll;
+
+  if (!levels.length) return null;
+
+  let best = null;
+
+  for (let i = 1; i < levels.length; i++) {
+    const prev = levels[i - 1];
+    const curr = levels[i];
+
+    const crossed =
+      (prev.gamma < 0 && curr.gamma > 0) ||
+      (prev.gamma > 0 && curr.gamma < 0);
+
+    if (crossed) {
+      const mid = (prev.strike + curr.strike) / 2;
+      const distance = price ? Math.abs(mid - price) : Math.abs(mid);
+
+      if (!best || distance < best.distance) {
+        best = { strike: mid, distance };
+      }
+    }
+  }
+
+  if (best) return best.strike;
+
+  const nearestSmallestAbs = levels
+    .map(x => ({
+      strike: x.strike,
+      distance: price ? Math.abs(x.strike - price) : Math.abs(x.strike),
+      absGamma: Math.abs(x.gamma)
+    }))
+    .sort((a, b) => a.distance - b.distance || a.absGamma - b.absGamma)[0];
+
+  return nearestSmallestAbs?.strike || null;
+}
+
+function flowSummary(callVolume, putVolume) {
   const total = callVolume + putVolume || 1;
 
   const callPct = Math.round((callVolume / total) * 100);
@@ -167,132 +227,148 @@ function flowSummary(chain) {
   if (callPct >= 58) bias = 'إيجابي';
   if (putPct >= 58) bias = 'سلبي';
 
-  return { callPct, putPct, bias, callVolume, putVolume };
+  return { callPct, putPct, bias };
 }
 
-function liquidityText(flow) {
-  if (flow.bias === 'إيجابي') {
-    return `تم رصد تفوق واضح في تدفقات CALL على عقود SPX،
-مما يدعم الزخم الإيجابي الحالي بشرط ثبات السعر فوق مناطق الدعم.`;
-  }
-
-  if (flow.bias === 'سلبي') {
-    return `تم رصد تفوق واضح في تدفقات PUT على عقود SPX،
-مما يعكس ضغطًا بيعيًا وحذرًا في حركة السوق الحالية.`;
-  }
-
-  return `تدفقات عقود SPX متوازنة حاليًا بين CALL و PUT،
-ولا توجد سيطرة واضحة مع استمرار التذبذب العرضي.`;
+function marketBiasByGamma(netGamma, flow) {
+  if (netGamma > 0 && flow.bias === 'إيجابي') return '🟢 إيجابية';
+  if (netGamma < 0 && flow.bias === 'سلبي') return '🔴 سلبية';
+  if (netGamma < 0) return '🟠 سلبية / متذبذبة';
+  if (netGamma > 0) return '🟢 إيجابية / مستقرة';
+  return '🟡 عرضية';
 }
 
-function aiSummary(price, flip, flow, topCall, topPut, hasGamma) {
-  if (!hasGamma) {
-    return `بيانات GEX / Gamma غير متوفرة حاليًا من الاشتراك أو من مزود البيانات.
-
-القراءة الحالية مبنية فقط على حجم تدفق العقود CALL / PUT، لذلك لا يتم اعتماد Gamma Flip حتى تتوفر بيانات Greeks.`;
+function liquidityText(flow, netGamma) {
+  if (flow.bias === 'إيجابي' && netGamma > 0) {
+    return `تدفقات CALL متقدمة مع Net Gamma إيجابي،
+وهذا يدعم بيئة أكثر استقرارًا وإيجابية طالما السعر فوق مناطق الدعم.`;
   }
 
-  if (!flip || !price) return 'لا توجد قراءة كافية حاليًا لتحديد موقع السعر مقابل Gamma Flip.';
-
-  if (price > flip && flow.bias === 'إيجابي') {
-    return `السوق يميل للإيجابية طالما SPX فوق Gamma Flip ${fmt(flip)}.
-
-اختراق ${fmt(topCall?.strike)} قد يدعم استمرار الزخم الصاعد،
-بينما كسر ${fmt(topPut?.strike)} قد يضعف القراءة الإيجابية.`;
+  if (flow.bias === 'سلبي' && netGamma < 0) {
+    return `تدفقات PUT متقدمة مع Net Gamma سلبي،
+وهذا يعكس ضغطًا بيعيًا واحتمالية حركة أكثر عنفًا في السوق.`;
   }
 
-  if (price < flip && flow.bias === 'سلبي') {
-    return `السوق يميل للسلبية طالما SPX تحت Gamma Flip ${fmt(flip)}.
-
-الثبات تحت ${fmt(flip)} يبقي الضغط البيعي قائمًا،
-وأقرب منطقة دفاع مهمة عند ${fmt(topPut?.strike)}.`;
+  if (netGamma < 0) {
+    return `رغم توازن التدفقات، Net Gamma ما زال سلبيًا،
+وهذا يعني أن السوق قابل للتذبذب والحركات السريعة.`;
   }
 
-  return `السوق متذبذب حاليًا قرب مستويات الجاما.
-
-لا توجد سيطرة واضحة بين CALL و PUT،
-والأفضل مراقبة Gamma Flip عند ${fmt(flip)} قبل ترجيح الاتجاه.`;
+  return `التدفقات الحالية متوازنة نسبيًا،
+ولا توجد سيطرة واضحة بين CALL و PUT في هذه اللحظة.`;
 }
 
-function gexLine(item, type) {
+function aiSummary(price, flip, flow, netGamma, topCall, topPut) {
+  const netText = netGamma > 0 ? 'إيجابي' : netGamma < 0 ? 'سلبي' : 'محايد';
+
+  if (!price || !flip) {
+    return `القراءة الحالية تعتمد على GEX وOptions Flow.
+
+Net Gamma: ${netText}
+سيطرة الكول: ${flow.callPct}%
+سيطرة البوت: ${flow.putPct}%`;
+  }
+
+  if (price > flip && flow.bias === 'إيجابي' && netGamma > 0) {
+    return `السوق يميل للإيجابية طالما SPX فوق Gamma Flip عند ${fmt(flip)}.
+
+أقوى مقاومة Gamma قريبة عند ${fmt(topCall?.strike)}،
+وأقوى دعم Gamma قريب عند ${fmt(topPut?.strike)}.`;
+  }
+
+  if (price < flip && netGamma < 0) {
+    return `السوق تحت Gamma Flip عند ${fmt(flip)} مع Net Gamma سلبي.
+
+هذا يعني بيئة أكثر خطورة وتذبذبًا،
+وأقرب دعم Gamma مهم عند ${fmt(topPut?.strike)}.`;
+  }
+
+  if (netGamma < 0) {
+    return `Net Gamma سلبي، لذلك السوق قابل لحركة عنيفة حتى لو كانت التدفقات متوازنة.
+
+راقب ${fmt(topPut?.strike)} كدعم مهم،
+وراقب ${fmt(topCall?.strike)} كمقاومة مؤثرة.`;
+  }
+
+  return `السوق حاليًا في وضع متوازن نسبيًا.
+
+راقب Gamma Flip عند ${fmt(flip)}،
+واختراق ${fmt(topCall?.strike)} أو كسر ${fmt(topPut?.strike)} هو الأهم.`;
+}
+
+function gammaLine(item, type) {
   if (!item) {
-    return `${type} N/A
-📊 GEX Exposure: غير متوفر`;
+    return `- ${type} N/A | Gamma: غير متوفر`;
   }
 
-  const sign = type === 'CALL' ? '+' : '-';
-
-  return `${type} ${item.strike}
-📊 GEX Exposure: ${sign}${fmt(Math.abs(item.gex))}`;
-}
-
-function gammaStatusText(price, flip, hasGamma) {
-  if (!hasGamma) return 'بيانات Gamma غير متوفرة من مزود البيانات حاليًا ⚠️';
-  if (!price || !flip) return 'لا يمكن تحديد موقع السعر مقابل Gamma Flip حاليًا ⚠️';
-
-  return price > flip
-    ? 'السعر فوق Gamma Flip ✅'
-    : 'السعر تحت Gamma Flip 🔻';
+  return `- Strike: ${fmtMoney(item.strike)} | Gamma: ${fmt(item.gamma)}`;
 }
 
 function buildSignature(data) {
   return [
-    data.flow.bias,
+    data.price || 'NO_PRICE',
     data.flip || 'NO_FLIP',
-    data.calls.map(x => x.strike).join(',') || 'NO_CALL_GEX',
-    data.puts.map(x => x.strike).join(',') || 'NO_PUT_GEX',
+    data.netGamma,
     data.flow.callPct,
-    data.flow.putPct
+    data.flow.putPct,
+    data.topCalls.map(x => x.strike).join(','),
+    data.topPuts.map(x => x.strike).join(',')
   ].join('|');
 }
 
 async function buildReport() {
-  const price = await getSpxPrice();
+  const chain = await getOptionsChain('I:SPX');
 
-  // مهم: لعقود المؤشرات نستخدم I:SPX
-  const spxChain = await getOptionsChain('I:SPX');
+  const price = getUnderlyingPrice(chain);
 
-  const calls = topGamma(spxChain, 'call');
-  const puts = topGamma(spxChain, 'put');
-  const flip = gammaFlip(spxChain);
-  const flow = flowSummary(spxChain);
+  const gamma = aggregateGammaByStrike(chain);
+  const flow = flowSummary(gamma.callVolume, gamma.putVolume);
+  const flip = gammaFlipNearPrice(gamma.netByStrike, price);
 
-  const hasGamma = calls.length > 0 || puts.length > 0 || flip !== null;
+  const state = marketBiasByGamma(gamma.netGamma, flow);
 
-  const data = { price, calls, puts, flip, flow };
+  const data = {
+    price,
+    flip,
+    netGamma: gamma.netGamma,
+    flow,
+    topCalls: gamma.topCalls,
+    topPuts: gamma.topPuts
+  };
+
   const signature = buildSignature(data);
 
   const text = `
-🧠 ST SPX Liquidity Radar
-
-📊 SPX: ${fmt(price)}
-📈 الحالة: ${flow.bias === 'إيجابي' ? '🟢 إيجابية' : flow.bias === 'سلبي' ? '🔴 سلبية' : '🟡 عرضية'}
-⏱ التحديث: الآن
-
-━━━━━━━━━━━━━━
-🟩 أعلى Gamma CALLS
-
-1. ${gexLine(calls[0], 'CALL')}
-
-2. ${gexLine(calls[1], 'CALL')}
-
-3. ${gexLine(calls[2], 'CALL')}
+📊 SPX Gamma Exposure Update
+🕒 ${nowKsa().toISOString().replace('T', ' ').slice(0, 19)}
+💵 Current Price: ${fmtMoney(price)}
+📈 الحالة: ${state}
 
 ━━━━━━━━━━━━━━
-🟥 أعلى Gamma PUTS
+🟩 Top ${TOP_N} Call Positions
+Positive Gamma
 
-1. ${gexLine(puts[0], 'PUT')}
+${gamma.topCalls.map(x => gammaLine(x, 'CALL')).join('\n') || '- لا توجد بيانات CALL Gamma'}
 
-2. ${gexLine(puts[1], 'PUT')}
+━━━━━━━━━━━━━━
+🟥 Top ${TOP_N} Put Positions
+Negative Gamma
 
-3. ${gexLine(puts[2], 'PUT')}
+${gamma.topPuts.map(x => gammaLine(x, 'PUT')).join('\n') || '- لا توجد بيانات PUT Gamma'}
+
+━━━━━━━━━━━━━━
+⚖️ Gamma Summary
+
+Total Call Gamma: ${fmt(gamma.totalCallGamma)}
+Total Put Gamma: ${fmt(gamma.totalPutGamma)}
+Net Gamma: ${fmt(gamma.netGamma)}
 
 ━━━━━━━━━━━━━━
 🎯 Gamma Flip
 
-📍 المستوى: ${flip ? fmt(flip) : 'غير متوفر'}
+المستوى الأقرب للسعر: ${flip ? fmtMoney(flip) : 'غير متوفر'}
 
-${gammaStatusText(price, flip, hasGamma)}
+${price && flip ? (price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma Flip 🔻') : 'لا يمكن تحديد موقع السعر حاليًا ⚠️'}
 
 ━━━━━━━━━━━━━━
 🔥 Options Flow
@@ -300,18 +376,18 @@ ${gammaStatusText(price, flip, hasGamma)}
 🟢 سيطرة الكول: ${flow.callPct}%
 🔴 سيطرة البوت: ${flow.putPct}%
 
-حجم CALL: ${fmt(flow.callVolume)}
-حجم PUT: ${fmt(flow.putVolume)}
+حجم CALL: ${fmt(gamma.callVolume)}
+حجم PUT: ${fmt(gamma.putVolume)}
 
 ━━━━━━━━━━━━━━
 🌑 السيولة المؤسسية
 
-${liquidityText(flow)}
+${liquidityText(flow, gamma.netGamma)}
 
 ━━━━━━━━━━━━━━
 🤖 AI Market Summary
 
-${aiSummary(price, flip, flow, calls[0], puts[0], hasGamma)}
+${aiSummary(price, flip, flow, gamma.netGamma, gamma.topCalls[0], gamma.topPuts[0])}
 
 ━━━━━━━━━━━━━━
 ⚠️ هذه متابعة تحليلية وليست توصية شراء أو بيع.
