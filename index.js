@@ -52,16 +52,17 @@ function isMarketTime() {
 }
 
 async function getSpxPrice() {
-  const tickers = ['I:SPX', 'SPX'];
+  const symbols = ['I:SPX', 'SPX'];
 
-  for (const ticker of tickers) {
+  for (const symbol of symbols) {
     try {
-      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev?adjusted=true&apiKey=${API_KEY}`;
+      const url = `${BASE_URL}/v2/aggs/ticker/${encodeURIComponent(symbol)}/prev?adjusted=true&apiKey=${API_KEY}`;
       const res = await axios.get(url);
       const price = res.data?.results?.[0]?.c;
+
       if (price) return price;
-    } catch (e) {
-      console.log(`Price failed for ${ticker}`);
+    } catch (err) {
+      console.log(`Price failed for ${symbol}:`, err.response?.data || err.message);
     }
   }
 
@@ -70,9 +71,9 @@ async function getSpxPrice() {
 
 async function getOptionsChain(symbol) {
   let results = [];
-  let url = `${BASE_URL}/v3/snapshot/options/${symbol}?limit=250&apiKey=${API_KEY}`;
+  let url = `${BASE_URL}/v3/snapshot/options/${encodeURIComponent(symbol)}?limit=250&apiKey=${API_KEY}`;
 
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 8; i++) {
     const res = await axios.get(url);
     results = results.concat(res.data?.results || []);
 
@@ -191,7 +192,7 @@ function aiSummary(price, flip, flow, topCall, topPut, hasGamma) {
 القراءة الحالية مبنية فقط على حجم تدفق العقود CALL / PUT، لذلك لا يتم اعتماد Gamma Flip حتى تتوفر بيانات Greeks.`;
   }
 
-  if (!flip) return 'لا توجد قراءة كافية حاليًا لتحديد Gamma Flip.';
+  if (!flip || !price) return 'لا توجد قراءة كافية حاليًا لتحديد موقع السعر مقابل Gamma Flip.';
 
   if (price > flip && flow.bias === 'إيجابي') {
     return `السوق يميل للإيجابية طالما SPX فوق Gamma Flip ${fmt(flip)}.
@@ -225,6 +226,15 @@ function gexLine(item, type) {
 📊 GEX Exposure: ${sign}${fmt(Math.abs(item.gex))}`;
 }
 
+function gammaStatusText(price, flip, hasGamma) {
+  if (!hasGamma) return 'بيانات Gamma غير متوفرة من مزود البيانات حاليًا ⚠️';
+  if (!price || !flip) return 'لا يمكن تحديد موقع السعر مقابل Gamma Flip حاليًا ⚠️';
+
+  return price > flip
+    ? 'السعر فوق Gamma Flip ✅'
+    : 'السعر تحت Gamma Flip 🔻';
+}
+
 function buildSignature(data) {
   return [
     data.flow.bias,
@@ -238,7 +248,9 @@ function buildSignature(data) {
 
 async function buildReport() {
   const price = await getSpxPrice();
-  const spxChain = await getOptionsChain('SPX');
+
+  // مهم: لعقود المؤشرات نستخدم I:SPX
+  const spxChain = await getOptionsChain('I:SPX');
 
   const calls = topGamma(spxChain, 'call');
   const puts = topGamma(spxChain, 'put');
@@ -249,10 +261,6 @@ async function buildReport() {
 
   const data = { price, calls, puts, flip, flow };
   const signature = buildSignature(data);
-
-  const gammaStatus = hasGamma
-    ? `${price && flip ? (price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma Flip 🔻') : 'تحتاج قراءة إضافية لتأكيد موقع السعر'}`
-    : 'بيانات Gamma غير متوفرة من مزود البيانات حاليًا ⚠️';
 
   const text = `
 🧠 ST SPX Liquidity Radar
@@ -284,7 +292,7 @@ async function buildReport() {
 
 📍 المستوى: ${flip ? fmt(flip) : 'غير متوفر'}
 
-${gammaStatus}
+${gammaStatusText(price, flip, hasGamma)}
 
 ━━━━━━━━━━━━━━
 🔥 Options Flow
