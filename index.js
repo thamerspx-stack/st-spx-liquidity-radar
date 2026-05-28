@@ -1,19 +1,25 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 const API_KEY = process.env.MASSIVE_API_KEY;
-const CHAT_ID = process.env.SPX_CHAT_ID;
+const CHAT_ID = process.env.SPX_CHAT_ID || '';
 
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .split(',')
   .map(x => x.trim())
   .filter(Boolean);
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
 const BASE_URL = 'https://api.massive.com';
 
-const TEST_MODE = true;
+const TEST_MODE = false;
 const TOP_N = 5;
 const INTERVAL_MS = 5 * 60 * 1000;
 const SEND_EVERY_MS = 15 * 60 * 1000;
@@ -35,48 +41,151 @@ function fmtMoney(n) {
   return `$${Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
 }
 
+function nowNewYork() {
+  return new Date(new Date().toLocaleString('en-US', {
+    timeZone: 'America/New_York'
+  }));
+}
+
 function nowKsa() {
-  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Riyadh' }));
+  return new Date(new Date().toLocaleString('en-US', {
+    timeZone: 'Asia/Riyadh'
+  }));
 }
 
 function isMarketTime() {
   if (TEST_MODE) return true;
 
-  const d = nowKsa();
+  const d = nowNewYork();
   const day = d.getDay();
   const h = d.getHours();
   const m = d.getMinutes();
   const minutes = h * 60 + m;
 
-  if (day === 5 || day === 6) return false;
+  if (day === 0 || day === 6) return false;
 
-  const open = 16 * 60 + 30;
-  const close = 23 * 60;
+  const open = 9 * 60 + 30;
+  const close = 16 * 60;
 
   return minutes >= open && minutes <= close;
 }
 
-async function getSPXPrice() {
-  const queries = [
-    `${BASE_URL}/v3/snapshot/indices?ticker=I:SPX&apiKey=${API_KEY}`,
-    `${BASE_URL}/v3/snapshot/indices?ticker=SPX&apiKey=${API_KEY}`
-  ];
+function randomCode(length = 10) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'ST-';
+  for (let i = 0; i < length; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
 
-  for (const url of queries) {
-    try {
-      const res = await axios.get(url);
-      const item = res.data?.results?.[0];
-      const price = item?.value || item?.session?.close || item?.session?.previous_close;
+async function hasActiveSubscription(userId) {
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', String(userId))
+    .gt('expires_at', new Date().toISOString())
+    .maybeSingle();
 
-      if (price && Number(price) > 1000) {
-        return Number(price);
-      }
-    } catch (err) {
-      console.log('SPX price fetch failed:', err.response?.data || err.message);
-    }
+  if (error) {
+    console.error('Subscription check error:', error.message);
+    return false;
   }
 
-  return null;
+  return !!data;
+}
+
+async function getActiveSubscribers() {
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('user_id, expires_at')
+    .gt('expires_at', new Date().toISOString());
+
+  if (error) {
+    console.error('Get subscribers error:', error.message);
+    return [];
+  }
+
+  return data || [];
+}
+
+async function createAccessCode(days, createdBy) {
+  const code = randomCode();
+
+  const { error } = await supabase.from('access_codes').insert({
+    code,
+    days,
+    created_by: String(createdBy)
+  });
+
+  if (error) throw error;
+
+  return code;
+}
+
+async function redeemCode(code, user) {
+  const cleanCode = String(code || '').trim().toUpperCase();
+
+  const { data: accessCode, error: codeError } = await supabase
+    .from('access_codes')
+    .select('*')
+    .eq('code', cleanCode)
+    .maybeSingle();
+
+  if (codeError) throw codeError;
+
+  if (!accessCode) {
+    return { ok: false, message: '❌ الكود غير صحيح.' };
+  }
+
+  if (accessCode.used) {
+    return { ok: false, message: '❌ هذا الكود مستخدم مسبقًا.' };
+  }
+
+  const userId = String(user.id);
+
+  const { data: sub } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  const now = new Date();
+  const baseDate =
+    sub && new Date(sub.expires_at) > now
+      ? new Date(sub.expires_at)
+      : now;
+
+  const expiresAt = new Date(baseDate.getTime() + accessCode.days * 24 * 60 * 60 * 1000);
+
+  const { error: upsertError } = await supabase
+    .from('subscriptions')
+    .upsert({
+      user_id: userId,
+      username: user.username || '',
+      first_name: user.first_name || '',
+      expires_at: expiresAt.toISOString(),
+      updated_at: new Date().toISOString()
+    });
+
+  if (upsertError) throw upsertError;
+
+  const { error: usedError } = await supabase
+    .from('access_codes')
+    .update({
+      used: true,
+      used_by: userId,
+      used_at: new Date().toISOString()
+    })
+    .eq('code', cleanCode);
+
+  if (usedError) throw usedError;
+
+  return {
+    ok: true,
+    expiresAt,
+    days: accessCode.days
+  };
 }
 
 async function getOptionsChain(symbol) {
@@ -194,53 +303,6 @@ function aggregateGammaByStrike(chain) {
   };
 }
 
-function gammaFlipNearPrice(netByStrike, price) {
-  const levelsAll = Array.from(netByStrike.entries())
-    .map(([strike, gamma]) => ({ strike: Number(strike), gamma: Number(gamma) }))
-    .filter(x => x.strike > 0 && x.gamma !== 0)
-    .sort((a, b) => a.strike - b.strike);
-
-  if (!levelsAll.length) return null;
-
-  const levels = price
-    ? levelsAll.filter(x => x.strike >= price * 0.9 && x.strike <= price * 1.1)
-    : levelsAll;
-
-  if (!levels.length) return null;
-
-  let best = null;
-
-  for (let i = 1; i < levels.length; i++) {
-    const prev = levels[i - 1];
-    const curr = levels[i];
-
-    const crossed =
-      (prev.gamma < 0 && curr.gamma > 0) ||
-      (prev.gamma > 0 && curr.gamma < 0);
-
-    if (crossed) {
-      const mid = (prev.strike + curr.strike) / 2;
-      const distance = price ? Math.abs(mid - price) : Math.abs(mid);
-
-      if (!best || distance < best.distance) {
-        best = { strike: mid, distance };
-      }
-    }
-  }
-
-  if (best) return best.strike;
-
-  const nearestSmallestAbs = levels
-    .map(x => ({
-      strike: x.strike,
-      distance: price ? Math.abs(x.strike - price) : Math.abs(x.strike),
-      absGamma: Math.abs(x.gamma)
-    }))
-    .sort((a, b) => a.distance - b.distance || a.absGamma - b.absGamma)[0];
-
-  return nearestSmallestAbs?.strike || null;
-}
-
 function nearestGammaLevels(gamma, price) {
   if (!price) {
     return { resistance: null, support: null, balance: null };
@@ -302,12 +364,12 @@ function marketBiasByGamma(netGamma, flow) {
 function liquidityText(flow, netGamma) {
   if (flow.bias === 'إيجابي' && netGamma > 0) {
     return `تدفقات CALL متقدمة مع Net Gamma إيجابي،
-وهذا يدعم بيئة أكثر استقرارًا وإيجابية طالما السعر فوق مناطق الدعم.`;
+وهذا يدعم بيئة أكثر استقرارًا وإيجابية.`;
   }
 
   if (flow.bias === 'سلبي' && netGamma < 0) {
     return `تدفقات PUT متقدمة مع Net Gamma سلبي،
-وهذا يعكس ضغطًا بيعيًا واحتمالية حركة أكثر عنفًا في السوق.`;
+وهذا يعكس ضغطًا بيعيًا واحتمالية حركة أكثر عنفًا.`;
   }
 
   if (netGamma < 0) {
@@ -317,50 +379,6 @@ function liquidityText(flow, netGamma) {
 
   return `التدفقات الحالية متوازنة نسبيًا،
 ولا توجد سيطرة واضحة بين CALL و PUT في هذه اللحظة.`;
-}
-
-function aiSummary(price, flip, flow, netGamma, nearest) {
-  const resistance = nearest?.resistance?.strike;
-  const support = nearest?.support?.strike;
-  const balance = nearest?.balance?.strike;
-
-  if (!price || !flip) {
-    return `القراءة الحالية تعتمد على GEX وOptions Flow.
-
-Net Gamma: ${netGamma > 0 ? 'إيجابي' : netGamma < 0 ? 'سلبي' : 'محايد'}
-سيطرة الكول: ${flow.callPct}%
-سيطرة البوت: ${flow.putPct}%`;
-  }
-
-  if (netGamma > 0 && price > flip) {
-    return `السعر فوق Gamma Flip وNet Gamma إيجابي، وهذا يعطي بيئة أكثر استقرارًا.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
-  }
-
-  if (netGamma < 0 && price < flip) {
-    return `السعر تحت Gamma Flip وNet Gamma سلبي، وهذا يعكس بيئة أكثر خطورة وتذبذبًا.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
-  }
-
-  if (netGamma < 0) {
-    return `Net Gamma سلبي، لذلك السوق قابل لحركة عنيفة حتى لو كانت التدفقات متوازنة.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
-  }
-
-  return `السوق حاليًا في وضع متوازن نسبيًا.
-
-🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
-🟩 أقرب دعم Gamma: ${fmtMoney(support)}
-🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
 }
 
 function gammaLine(item) {
@@ -381,10 +399,35 @@ CALL Gamma: ${fmt(item.callGamma)}
 PUT Gamma: -${fmt(item.putGamma)}`;
 }
 
+function aiSummary(flow, netGamma, nearest) {
+  const resistance = nearest?.resistance?.strike;
+  const support = nearest?.support?.strike;
+  const balance = nearest?.balance?.strike;
+
+  if (netGamma > 0) {
+    return `Net Gamma إيجابي، وهذا يعطي بيئة أكثر استقرارًا.
+
+🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
+🟩 أقرب دعم Gamma: ${fmtMoney(support)}
+🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
+  }
+
+  if (netGamma < 0) {
+    return `Net Gamma سلبي، لذلك السوق قابل لحركة عنيفة حتى لو كانت التدفقات متوازنة.
+
+🟥 أقرب مقاومة Gamma: ${fmtMoney(resistance)}
+🟩 أقرب دعم Gamma: ${fmtMoney(support)}
+🟨 منطقة التوازن الحالية: ${fmtMoney(balance)}`;
+  }
+
+  return `السوق حاليًا في وضع متوازن نسبيًا.
+
+سيطرة الكول: ${flow.callPct}%
+سيطرة البوت: ${flow.putPct}%`;
+}
+
 function buildSignature(data) {
   return [
-    data.price || 'NO_PRICE',
-    data.flip || 'NO_FLIP',
     data.netGamma,
     data.flow.callPct,
     data.flow.putPct,
@@ -398,23 +441,14 @@ function buildSignature(data) {
 
 async function buildReport() {
   const chain = await getOptionsChain('I:SPX');
-
-  let price = await getSPXPrice();
-
-  if (!price) {
-    price = getFallbackUnderlyingPrice(chain);
-  }
+  const price = getFallbackUnderlyingPrice(chain);
 
   const gamma = aggregateGammaByStrike(chain);
   const flow = flowSummary(gamma.callVolume, gamma.putVolume);
-  const flip = gammaFlipNearPrice(gamma.netByStrike, price);
   const nearest = nearestGammaLevels(gamma, price);
-
   const state = marketBiasByGamma(gamma.netGamma, flow);
 
   const data = {
-    price,
-    flip,
     netGamma: gamma.netGamma,
     flow,
     topCalls: gamma.topCalls,
@@ -427,7 +461,6 @@ async function buildReport() {
   const text = `
 📊 SPX Gamma Exposure Update
 🕒 ${nowKsa().toISOString().replace('T', ' ').slice(0, 19)}
-💵 Current Price: ${fmtMoney(price)}
 📈 الحالة: ${state}
 
 ━━━━━━━━━━━━━━
@@ -462,13 +495,6 @@ Total Put Gamma: ${fmt(gamma.totalPutGamma)}
 Net Gamma: ${fmt(gamma.netGamma)}
 
 ━━━━━━━━━━━━━━
-🎯 Gamma Flip
-
-المستوى الأقرب للسعر: ${flip ? fmtMoney(flip) : 'غير متوفر'}
-
-${price && flip ? (price > flip ? 'السعر فوق Gamma Flip ✅' : 'السعر تحت Gamma Flip 🔻') : 'لا يمكن تحديد موقع السعر حاليًا ⚠️'}
-
-━━━━━━━━━━━━━━
 🔥 Options Flow
 
 🟢 سيطرة الكول: ${flow.callPct}%
@@ -485,7 +511,7 @@ ${liquidityText(flow, gamma.netGamma)}
 ━━━━━━━━━━━━━━
 🤖 AI Market Summary
 
-${aiSummary(price, flip, flow, gamma.netGamma, nearest)}
+${aiSummary(flow, gamma.netGamma, nearest)}
 
 ━━━━━━━━━━━━━━
 ⚠️ هذه متابعة تحليلية وليست توصية شراء أو بيع.
@@ -494,7 +520,27 @@ ${aiSummary(price, flip, flow, gamma.netGamma, nearest)}
   return { text, signature };
 }
 
-async function scanAndSend(force = false) {
+async function sendReportToActiveSubscribers(text) {
+  const subscribers = await getActiveSubscribers();
+
+  for (const sub of subscribers) {
+    try {
+      await bot.sendMessage(sub.user_id, text);
+    } catch (err) {
+      console.error(`Failed to send to ${sub.user_id}:`, err.message);
+    }
+  }
+
+  if (CHAT_ID) {
+    try {
+      await bot.sendMessage(CHAT_ID, text);
+    } catch (err) {
+      console.error('Failed to send to CHAT_ID:', err.message);
+    }
+  }
+}
+
+async function scanAndSend(force = false, targetChatId = null) {
   try {
     if (!isMarketTime()) {
       console.log('Market closed. Skipping scan.');
@@ -503,12 +549,17 @@ async function scanAndSend(force = false) {
 
     const { text, signature } = await buildReport();
 
+    if (targetChatId) {
+      await bot.sendMessage(targetChatId, text);
+      return;
+    }
+
     const now = Date.now();
     const changed = signature !== lastSentSignature;
     const timePassed = now - lastSentAt >= SEND_EVERY_MS;
 
     if (force || changed || timePassed) {
-      await bot.sendMessage(CHAT_ID, text);
+      await sendReportToActiveSubscribers(text);
       lastSentSignature = signature;
       lastSentAt = now;
       console.log('SPX report sent.');
@@ -520,10 +571,113 @@ async function scanAndSend(force = false) {
   }
 }
 
+bot.onText(/\/start/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    `هلا بك في بوت سيولة وقاما SPX.
+
+لتفعيل الاشتراك:
+أرسل كود الاشتراك مباشرة هنا.
+
+مثال:
+ST-ABCDEFG123
+
+لمعرفة حالة اشتراكك:
+/my`
+  );
+});
+
+bot.onText(/\/create(?:\s+(\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg)) {
+    return bot.sendMessage(msg.chat.id, '❌ هذا الأمر خاص بالإدارة.');
+  }
+
+  const days = Number(match[1] || 30);
+
+  if (!days || days < 1 || days > 365) {
+    return bot.sendMessage(msg.chat.id, '❌ استخدم الأمر بهذا الشكل:\n/create 30');
+  }
+
+  try {
+    const code = await createAccessCode(days, msg.from.id);
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `✅ تم إنشاء كود اشتراك
+
+الكود:
+${code}
+
+المدة:
+${days} يوم`
+    );
+  } catch (err) {
+    console.error('Create code error:', err.message);
+    await bot.sendMessage(msg.chat.id, '❌ حدث خطأ أثناء إنشاء الكود.');
+  }
+});
+
+bot.on('message', async (msg) => {
+  const text = String(msg.text || '').trim().toUpperCase();
+
+  if (!text) return;
+  if (text.startsWith('/')) return;
+  if (!text.startsWith('ST-')) return;
+
+  try {
+    const result = await redeemCode(text, msg.from);
+
+    if (!result.ok) {
+      return bot.sendMessage(msg.chat.id, result.message);
+    }
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `✅ تم تفعيل اشتراكك بنجاح
+
+المدة المضافة: ${result.days} يوم
+ينتهي الاشتراك:
+${result.expiresAt.toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' })}`
+    );
+  } catch (err) {
+    console.error('Redeem direct code error:', err.message);
+    await bot.sendMessage(msg.chat.id, '❌ حدث خطأ أثناء تفعيل الكود.');
+  }
+});
+
+bot.onText(/\/my/, async (msg) => {
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', String(msg.from.id))
+    .maybeSingle();
+
+  if (error) {
+    return bot.sendMessage(msg.chat.id, '❌ حدث خطأ أثناء فحص الاشتراك.');
+  }
+
+  if (!data) {
+    return bot.sendMessage(msg.chat.id, '❌ لا يوجد اشتراك مفعل على حسابك.');
+  }
+
+  const expiresAt = new Date(data.expires_at);
+  const active = expiresAt > new Date();
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `${active ? '✅ اشتراكك فعال' : '❌ اشتراكك منتهي'}
+
+ينتهي في:
+${expiresAt.toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' })}`
+  );
+});
+
 bot.onText(/\/admin/, async (msg) => {
   if (!isAdmin(msg)) {
     return bot.sendMessage(msg.chat.id, '❌ هذا الأمر خاص بالإدارة.');
   }
+
+  const subscribers = await getActiveSubscribers();
 
   return bot.sendMessage(
     msg.chat.id,
@@ -532,20 +686,25 @@ bot.onText(/\/admin/, async (msg) => {
 ✅ البوت شغال
 🧪 TEST_MODE: ${TEST_MODE ? 'مفعل' : 'مغلق'}
 👤 عدد المدراء: ${ADMIN_IDS.length}
+✅ المشتركين النشطين: ${subscribers.length}
 
-الأوامر الحالية:
-/admin
-/status
-/test`
+الأوامر:
+/create 30
+/my
+/test
+/status`
   );
 });
 
 bot.onText(/\/status/, async (msg) => {
+  const active = await hasActiveSubscription(msg.from.id);
+
   await bot.sendMessage(
     msg.chat.id,
     `✅ ST SPX Liquidity Radar شغال
 ⏱ الفحص كل 5 دقائق
-🧪 TEST_MODE: ${TEST_MODE ? 'مفعل' : 'مغلق'}`
+🧪 TEST_MODE: ${TEST_MODE ? 'مفعل' : 'مغلق'}
+🔐 اشتراكك: ${active ? 'فعال ✅' : 'غير فعال ❌'}`
   );
 });
 
@@ -555,7 +714,7 @@ bot.onText(/\/test/, async (msg) => {
   }
 
   await bot.sendMessage(msg.chat.id, '⏳ جاري إرسال تقرير تجريبي...');
-  await scanAndSend(true);
+  await scanAndSend(true, msg.chat.id);
 });
 
 scanAndSend(true);
